@@ -43,6 +43,28 @@ This app exploits the fact that the suppression does **not** apply to
 
 Toggle off "Canvas in-motion" for normal rendering (parked use).
 
+## Default channel list
+
+The app ships with a bundled default playlist (`public/channels.m3u`) of
+**free-to-air / public** channels that are verified to work in the browser.
+"Known good" means **CORS + HLS + a live segment**: hls.js fetches segments
+cross-origin, so a channel only plays if its CDN sends
+`Access-Control-Allow-Origin: *`. Open the app and they're there — no setup.
+Override with your own M3U any time via the gear ⚙ → Playlist.
+
+Channels drift (streams die, move, drop CORS), so the list is maintained by a
+reproducible pipeline in `scripts/`:
+
+```sh
+python3 scripts/curate.py           # re-fetch sources, re-gate, rewrite channels.m3u
+python3 scripts/curate.py --check   # spot-check the current list (exit 1 if any dead)
+```
+
+`scripts/curate.py` pulls the legal/public source M3Us listed in
+`scripts/sources.txt`, drops anything that fails the CORS/HLS/segment gate, and
+rewrites `public/channels.m3u` (sports-first, with logos where available).
+Add or edit sources in `sources.txt` and re-run to grow the list.
+
 ## Browser viewport (verified, firmware 2026.26+)
 
 The 2026.26 summer update changed the browser's pixel density from dpr 1.0 to
