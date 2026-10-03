@@ -37,7 +37,7 @@ const els = {
 
 const LS_M3U = "tesla-iptv.m3u-url";
 const LS_MODE = "tesla-iptv.render-mode";
-const DEFAULT_M3U = `${import.meta.env.BASE_URL}test.m3u`;
+const DEFAULT_M3U = `${import.meta.env.BASE_URL}channels.m3u`;
 
 const player = new Player(els.video, els.canvas);
 let channels: Channel[] = [];

@@ -1,5 +1,0 @@
-#EXTM3U
-#EXTINF:-1 tvg-id="demo.sports1" tvg-name="Demo Sports HD" group-title="Sports",Demo Sports HD
-https://test-streams.mux.dev/x36xhzz/x36xhzz.m3u8
-#EXTINF:-1 tvg-id="demo.news1" tvg-name="Demo News" group-title="News",Demo News
-https://devstreaming-cdn.apple.com/dash/streaming/bipbop_4x3/bipbop_4x3.m3u8
