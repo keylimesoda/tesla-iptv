@@ -69,6 +69,7 @@ html, body {
   flex-direction: column;
   height: 100%;
 }
+#list-view[hidden] { display: none; }
 
 #list-head {
   display: flex;
@@ -151,6 +152,7 @@ html, body {
 
 /* ---------- player view ---------- */
 #player-view { display: flex; flex-direction: column; height: 100%; }
+#player-view[hidden] { display: none; }
 
 #stage {
   position: relative;
