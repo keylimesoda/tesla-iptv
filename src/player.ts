@@ -45,7 +45,13 @@ export class Player {
       hls.loadSource(url);
       hls.attachMedia(v);
       hls.on(Hls.Events.MANIFEST_PARSED, () => {
-        void v.play().catch(() => {});
+        void v.play().catch(() => {
+          // Unmuted autoplay was blocked (play() runs after the manifest
+          // fetch, outside the click gesture). Retry muted so the picture
+          // still starts; the user unmutes from the controls.
+          v.muted = true;
+          void v.play().catch(() => {});
+        });
       });
       hls.on(Hls.Events.ERROR, (_e, data) => {
         if (data.fatal) {
@@ -65,7 +71,12 @@ export class Player {
       });
     } else if (v.canPlayType("application/vnd.apple.mpegurl")) {
       v.src = url;
-      v.addEventListener("loadedmetadata", () => void v.play().catch(() => {}), { once: true });
+      v.addEventListener("loadedmetadata", () => {
+        void v.play().catch(() => {
+          v.muted = true;
+          void v.play().catch(() => {});
+        });
+      }, { once: true });
     } else {
       window.dispatchEvent(new CustomEvent("player:error", { detail: { message: "HLS not supported" } }));
     }
