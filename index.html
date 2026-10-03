@@ -1,0 +1,89 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, viewport-fit=cover" />
+  <meta name="theme-color" content="#0a0a0a" />
+  <link rel="manifest" href="manifest.webmanifest" />
+  <title>Tesla IPTV</title>
+  <link rel="icon" href="icon.svg" type="image/svg+xml" />
+  <link rel="stylesheet" href="/src/style.css" />
+</head>
+<body>
+  <div id="app">
+    <header id="topbar">
+      <button id="back" class="icon-btn" aria-label="Back" hidden>
+        <svg viewBox="0 0 24 24" width="26" height="26" aria-hidden="true"><path d="M15 18l-6-6 6-6" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round"/></svg>
+      </button>
+      <h1 id="title">Tesla IPTV</h1>
+      <button id="settings" class="icon-btn" aria-label="Settings">
+        <svg viewBox="0 0 24 24" width="26" height="26" aria-hidden="true"><circle cx="12" cy="12" r="3.2" fill="none" stroke="currentColor" stroke-width="2.2"/><path d="M12 2.5v3M12 18.5v3M21.5 12h-3M5.5 12h-3M18.7 5.3l-2.1 2.1M7.4 16.6l-2.1 2.1M18.7 18.7l-2.1-2.1M7.4 7.4L5.3 5.3" stroke="currentColor" stroke-width="2.2" stroke-linecap="round"/></svg>
+      </button>
+    </header>
+
+    <main id="main">
+      <!-- Channel list view -->
+      <section id="list-view">
+        <div id="list-head">
+          <input id="search" type="search" placeholder="Search channels" autocomplete="off" />
+          <span id="count" class="muted"></span>
+        </div>
+        <ul id="channels" aria-label="Channels"></ul>
+        <p id="status" class="muted"></p>
+      </section>
+
+      <!-- Player view -->
+      <section id="player-view" hidden>
+        <div id="stage">
+          <video id="video" playsinline preload="auto"></video>
+          <canvas id="canvas"></canvas>
+          <button id="big-play" aria-label="Play">
+            <svg viewBox="0 0 24 24" width="88" height="88" aria-hidden="true"><path d="M8 5v14l11-7z" fill="currentColor"/></svg>
+          </button>
+        </div>
+        <div id="controls">
+          <button id="play" class="icon-btn" aria-label="Play or pause">
+            <svg id="play-icon" viewBox="0 0 24 24" width="30" height="30" aria-hidden="true"><path d="M8 5v14l11-7z" fill="currentColor"/></svg>
+          </button>
+          <div id="now-playing">
+            <div id="channel-name"></div>
+            <div id="channel-sub" class="muted"></div>
+          </div>
+          <div id="ctl-right">
+            <label id="canvas-toggle" title="In-motion (canvas) rendering">
+              <input type="checkbox" id="canvas-mode" />
+              <span>Canvas<br/>in-motion</span>
+            </label>
+            <button id="mute" class="icon-btn" aria-label="Mute">
+              <svg viewBox="0 0 24 24" width="28" height="28" aria-hidden="true"><path d="M4 9v6h4l5 5V4L8 9H4z" fill="currentColor"/><path id="mute-waves" d="M16.5 8.5a5 5 0 0 1 0 7M19 6a8 8 0 0 1 0 12" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"/></svg>
+            </button>
+            <button id="fullscreen" class="icon-btn" aria-label="Fullscreen">
+              <svg viewBox="0 0 24 24" width="28" height="28" aria-hidden="true"><path d="M4 9V4h5M20 9V4h-5M4 15v5h5M20 15v5h-5" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round"/></svg>
+            </button>
+          </div>
+        </div>
+      </section>
+    </main>
+  </div>
+
+  <!-- Settings sheet -->
+  <div id="sheet" hidden>
+    <div id="sheet-card">
+      <h2>Settings</h2>
+      <label for="m3u-url">Playlist (M3U / M3U8 URL)</label>
+      <input id="m3u-url" type="url" placeholder="https://example.com/playlist.m3u" autocomplete="off" />
+      <p id="sheet-hint" class="muted">
+        Paste your IPTV M3U/M3U8 URL. Non-DRM HLS streams play. Xtream Codes: use the
+        <code>get.php</code> live playlist URL. DRM-locked services (Netflix, most premium
+        league feeds) will not play.
+      </p>
+      <div id="sheet-actions">
+        <button id="sheet-cancel" class="btn">Cancel</button>
+        <button id="sheet-apply" class="btn primary">Load playlist</button>
+      </div>
+    </div>
+  </div>
+
+  <script type="module" src="/src/main.ts"></script>
+</body>
+</html>
