@@ -51,24 +51,27 @@ values (2024 Model Y / 2023 Model S, Chromium 148):
 
 | State | CSS viewport | dpr | Physical |
 |---|---|---|---|
-| Parked (MY 2026+ Juniper, 16" 2560×1440) | ~1280×720 | ~2.0 | 2560×1440 (184 PPI) |
-| In motion (MY 2026+ Juniper) | ~800×600 | ~2.0 | ~1600×1200 |
+| Parked (MY 2026+ Juniper, 16" 2560×1440) | ≈1306×735 | 1.96 | 2560×1440 (184 PPI) |
+| In motion (MY 2026+ Juniper) | **804×638** | 1.96 | ≈1576×1250 |
 | Parked (M3/Y 2020-25, 15.4" 1920×1200) | 1254×784 | 1.53 | 1920×1200 (147 PPI) |
 | In motion (M3/Y 2020-25) | ~773×601 | 1.53 | ~1183×920 |
 | Parked (S/X 2021+, 17" 2200×1300) | ~1410×833 | 1.56 | 2200×1300 (150 PPI) |
 
 Notes for building for the car:
 
-- Design for **~800×600 CSS while driving** (Juniper MY: ~800×600 @ dpr 2; older M3/Y: 773×601 @ dpr 1.53); it grows to full-screen when parked.
+- Design for **804×638 CSS while driving** on the Juniper MY (measured in-car,
+  dpr 1.96, Chrome 148; parked ≈1306×735); older M3/Y: 773×601 @ dpr 1.53.
 - `pointer: fine` / `hover: hover` are now reported (touch detection via media
   queries is unreliable); `maxTouchPoints` is still 16.
 - `prefers-color-scheme` reports light; this app pins a dark theme.
 - Pre-update firmware reports the raw panel as CSS (1920×1200 @ dpr 1.0).
 - The canvas backing store is capped at 2× device pixels.
 
-Sources: Tesla Motors Club measurement thread (dpr 1.0 → 1.53, in-motion
-773×601 window), Not a Tesla App screen comparison (panel sizes/resolutions),
-codriver.io summer-2026 guide (Chromium 148, pointer/hover flip).
+Sources: cliamp-web in-car measurement (2026 MY Performance: 804×638 CSS @ dpr
+1.96, Chrome 148), Tesla Motors Club measurement thread (dpr 1.0 → 1.53,
+in-motion 773×601 window on 1920×1200 cars), Not a Tesla App screen comparison
+(panel sizes/resolutions), codriver.io summer-2026 guide (Chromium 148,
+pointer/hover flip).
 
 ## Limitations
 
