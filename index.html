@@ -7,8 +7,8 @@
   <link rel="manifest" href="manifest.webmanifest" />
   <title>Tesla IPTV</title>
   <link rel="icon" href="icon.svg" type="image/svg+xml" />
-  <script type="module" crossorigin src="/tesla-iptv/assets/index-ZnuELzEI.js"></script>
-  <link rel="stylesheet" crossorigin href="/tesla-iptv/assets/index-BQnGOi4Q.css">
+  <script type="module" crossorigin src="/tesla-iptv/assets/index-D2ioTo0j.js"></script>
+  <link rel="stylesheet" crossorigin href="/tesla-iptv/assets/index-BdNdxXSj.css">
 </head>
 <body>
   <div id="app">
@@ -77,6 +77,18 @@
         Paste your IPTV M3U/M3U8 URL. Non-DRM HLS streams play. Xtream Codes: use the
         <code>get.php</code> live playlist URL. DRM-locked services (Netflix, most premium
         league feeds) will not play.
+      </p>
+
+      <div id="setup-row">
+        <button id="gen-setup" class="btn">Generate wiring link</button>
+      </div>
+      <div id="setup-result" hidden>
+        <input id="setup-link" type="text" readonly autocomplete="off" />
+        <button id="copy-setup" class="btn primary">Copy</button>
+      </div>
+      <p id="setup-hint" class="muted">
+        Wire the car without typing: generate a link here (on your phone), open it once in the
+        car's browser — the playlist gets saved.
       </p>
       <div id="sheet-actions">
         <button id="sheet-cancel" class="btn">Cancel</button>
