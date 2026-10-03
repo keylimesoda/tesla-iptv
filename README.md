@@ -7,14 +7,20 @@ car is driving.
 
 ## Use it in the car
 
-1. Open the app URL in the Tesla browser: **https://keylimesoda.github.io/tesla-iptv/**
-2. Tap the gear icon → paste your **M3U/M3U8 playlist URL** → **Load playlist**.
+**One-time wiring (no typing in the car):**
+
+1. On your **phone**, open **https://keylimesoda.github.io/tesla-iptv/** and
+   tap the gear ⚙.
+2. Paste your **M3U/M3U8 playlist URL** → **Generate wiring link** → **Copy**.
    - Xtream Codes accounts use the live playlist URL:
      `http://<host>/get.php?username=<u>&password=<p>&type=m3u_plus`
-   - The URL is remembered in the browser (localStorage) for next time.
-3. Tap a channel to play. The **"Canvas in-motion"** toggle is on by default —
-   that's the mode to use while driving.
-4. Use the steering-wheel scroll wheel or the on-screen buttons for volume.
+3. In the car's browser, open that wiring link **once** (you can add it to
+   the browser's home shortcuts). The playlist is saved to the car's browser
+   storage — every later launch loads it directly.
+
+**In the car day-to-day:** open the app, tap a channel to play.
+**"Canvas in-motion"** is on by default — that's the driving mode. Volume via
+steering-wheel scroll wheel or on-screen button.
 
 > **Passenger use only.** The driver must not watch or operate this while
 > driving. In-motion front-screen video defeats Tesla's in-motion video
@@ -36,6 +42,31 @@ This app exploits the fact that the suppression does **not** apply to
   suppressed while driving.
 
 Toggle off "Canvas in-motion" for normal rendering (parked use).
+
+## Browser viewport (verified, firmware 2026.26+)
+
+The 2026.26 summer update changed the browser's pixel density from dpr 1.0 to
+~1.53, and the browser window is **not full-screen while driving**. Measured
+values (2024 Model Y / 2023 Model S, Chromium 148):
+
+| State | CSS viewport | dpr | Physical |
+|---|---|---|---|
+| Parked (M3/Y, 15.4" 1920×1200) | 1254×784 | 1.53 | 1920×1200 (147 PPI) |
+| In motion (M3/Y) | ~773×601 | 1.53 | ~1183×920 |
+| Parked (S/X 2021+, 17" 2200×1300) | ~1410×833 | 1.56 | 2200×1300 (150 PPI) |
+
+Notes for building for the car:
+
+- Design for **773×601 CSS while driving**; it grows to 1254×784 when parked.
+- `pointer: fine` / `hover: hover` are now reported (touch detection via media
+  queries is unreliable); `maxTouchPoints` is still 16.
+- `prefers-color-scheme` reports light; this app pins a dark theme.
+- Pre-update firmware reports the raw panel as CSS (1920×1200 @ dpr 1.0).
+- The canvas backing store is capped at 2× device pixels.
+
+Sources: Tesla Motors Club measurement thread (dpr 1.0 → 1.53, in-motion
+773×601 window), Not a Tesla App screen comparison (panel sizes/resolutions),
+codriver.io summer-2026 guide (Chromium 148, pointer/hover flip).
 
 ## Limitations
 
