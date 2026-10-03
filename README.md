@@ -51,13 +51,15 @@ values (2024 Model Y / 2023 Model S, Chromium 148):
 
 | State | CSS viewport | dpr | Physical |
 |---|---|---|---|
-| Parked (M3/Y, 15.4" 1920×1200) | 1254×784 | 1.53 | 1920×1200 (147 PPI) |
-| In motion (M3/Y) | ~773×601 | 1.53 | ~1183×920 |
+| Parked (MY 2026+ Juniper, 16" 2560×1440) | ~1280×720 | ~2.0 | 2560×1440 (184 PPI) |
+| In motion (MY 2026+ Juniper) | ~800×600 | ~2.0 | ~1600×1200 |
+| Parked (M3/Y 2020-25, 15.4" 1920×1200) | 1254×784 | 1.53 | 1920×1200 (147 PPI) |
+| In motion (M3/Y 2020-25) | ~773×601 | 1.53 | ~1183×920 |
 | Parked (S/X 2021+, 17" 2200×1300) | ~1410×833 | 1.56 | 2200×1300 (150 PPI) |
 
 Notes for building for the car:
 
-- Design for **773×601 CSS while driving**; it grows to 1254×784 when parked.
+- Design for **~800×600 CSS while driving** (Juniper MY: ~800×600 @ dpr 2; older M3/Y: 773×601 @ dpr 1.53); it grows to full-screen when parked.
 - `pointer: fine` / `hover: hover` are now reported (touch detection via media
   queries is unreliable); `maxTouchPoints` is still 16.
 - `prefers-color-scheme` reports light; this app pins a dark theme.
