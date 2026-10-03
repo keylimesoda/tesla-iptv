@@ -41,6 +41,7 @@ const DEFAULT_M3U = `${import.meta.env.BASE_URL}channels.m3u`;
 
 const player = new Player(els.video, els.canvas);
 let channels: Channel[] = [];
+const collapsedGroups = new Set<string>();
 
 function setStatus(msg: string): void {
   els.status.textContent = msg;
@@ -98,12 +99,31 @@ function renderList(filter: string): void {
     if (!visible.length) continue;
     shown += visible.length;
 
+    // Searching shows every match; otherwise honour the collapse state.
+    const open = q ? true : !collapsedGroups.has(group);
+
     const header = document.createElement("li");
-    header.className = "group";
-    header.textContent = group;
+    header.className = "group" + (open ? "" : " is-collapsed");
+    const chev = document.createElement("span");
+    chev.className = "chev";
+    const label = document.createElement("span");
+    label.className = "group-label";
+    label.textContent = group;
+    const cnt = document.createElement("span");
+    cnt.className = "group-count";
+    cnt.textContent = String(visible.length);
+    header.append(chev, label, cnt);
+    header.addEventListener("click", () => {
+      if (q) return; // no toggling while a search filter is active
+      if (collapsedGroups.has(group)) collapsedGroups.delete(group);
+      else collapsedGroups.add(group);
+      renderList(els.search.value);
+    });
     frag.append(header);
 
-    for (const ch of visible) frag.append(channelItem(ch));
+    if (open) {
+      for (const ch of visible) frag.append(channelItem(ch));
+    }
   }
 
   els.channels.replaceChildren(frag);

@@ -1,0 +1,7 @@
+# Default-group<TAB>source-m3u-url  (group used when a channel has no group-title)
+# Legal / free-to-air public sources only. Re-run curate.py to refresh.
+News	https://raw.githubusercontent.com/notanewbie/LegalStream/master/packages/news/local.m3u8
+Sports	https://raw.githubusercontent.com/freecasthub/public-iptv/main/sports.m3u
+News	https://raw.githubusercontent.com/freecasthub/public-iptv/main/news.m3u
+Education	https://raw.githubusercontent.com/freecasthub/public-iptv/main/education.m3u
+Weather	https://raw.githubusercontent.com/freecasthub/public-iptv/main/weather.m3u
