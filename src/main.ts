@@ -29,6 +29,10 @@ const els = {
   sheetApply: $<HTMLButtonElement>("#sheet-apply"),
   sheetCancel: $<HTMLButtonElement>("#sheet-cancel"),
   settings: $<HTMLButtonElement>("#settings"),
+  genSetup: $<HTMLButtonElement>("#gen-setup"),
+  setupResult: $<HTMLElement>("#setup-result"),
+  setupLink: $<HTMLInputElement>("#setup-link"),
+  copySetup: $<HTMLButtonElement>("#copy-setup"),
 };
 
 const LS_M3U = "tesla-iptv.m3u-url";
@@ -42,13 +46,13 @@ function setStatus(msg: string): void {
   els.status.textContent = msg;
 }
 
-function loadChannels(url: string): void {
+function loadChannels(url: string, note = ""): void {
   setStatus("Loading playlist…");
   fetchM3U(url)
     .then((list) => {
       channels = list;
       renderList(els.search.value);
-      setStatus(`${list.length} channels loaded.`);
+      setStatus(`${list.length} channels loaded.${note ? " " + note : ""}`);
     })
     .catch((err) => {
       channels = [];
@@ -217,6 +221,47 @@ els.sheet.addEventListener("click", (e) => {
   if (e.target === els.sheet) closeSheet();
 });
 
+// --- wiring: one-time setup link ---
+function base64urlEncode(s: string): string {
+  return btoa(encodeURIComponent(s)).replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, "");
+}
+
+function base64urlDecode(s: string): string | null {
+  try {
+    return decodeURIComponent(atob(s.replace(/-/g, "+").replace(/_/g, "/")));
+  } catch {
+    return null;
+  }
+}
+
+/** Consume a #setup=<b64url(m3u-url)> hash: wire the playlist into localStorage. */
+function applySetupHash(): boolean {
+  const m = location.hash.match(/^#setup=(.+)$/);
+  if (!m) return false;
+  const url = base64urlDecode(m[1]);
+  if (!url || !/^https?:\/\//i.test(url)) return false;
+  localStorage.setItem(LS_M3U, url);
+  history.replaceState(null, "", location.pathname + location.search);
+  return true;
+}
+
+function buildSetupLink(m3uUrl: string): string {
+  return `${location.origin}${import.meta.env.BASE_URL}#setup=${base64urlEncode(m3uUrl)}`;
+}
+
+els.genSetup.addEventListener("click", () => {
+  const url = els.m3uUrl.value.trim();
+  els.setupLink.value = url ? buildSetupLink(url) : "";
+  els.setupResult.hidden = !url;
+});
+
+els.copySetup.addEventListener("click", () => {
+  void navigator.clipboard.writeText(els.setupLink.value).catch(() => {
+    els.setupLink.select();
+  });
+});
+
 // --- init ---
+const wired = applySetupHash();
 const initialUrl = localStorage.getItem(LS_M3U) ?? DEFAULT_M3U;
-loadChannels(initialUrl);
+loadChannels(initialUrl, wired ? "(wired from setup link)" : "");

@@ -77,6 +77,18 @@
         <code>get.php</code> live playlist URL. DRM-locked services (Netflix, most premium
         league feeds) will not play.
       </p>
+
+      <div id="setup-row">
+        <button id="gen-setup" class="btn">Generate wiring link</button>
+      </div>
+      <div id="setup-result" hidden>
+        <input id="setup-link" type="text" readonly autocomplete="off" />
+        <button id="copy-setup" class="btn primary">Copy</button>
+      </div>
+      <p id="setup-hint" class="muted">
+        Wire the car without typing: generate a link here (on your phone), open it once in the
+        car's browser — the playlist gets saved.
+      </p>
       <div id="sheet-actions">
         <button id="sheet-cancel" class="btn">Cancel</button>
         <button id="sheet-apply" class="btn primary">Load playlist</button>

@@ -287,3 +287,24 @@ html, body {
 }
 .btn.primary { background: var(--accent); border-color: var(--accent); color: #fff; }
 .btn:active { transform: scale(0.98); }
+
+/* ---------- wiring / setup ---------- */
+button, input { touch-action: manipulation; }
+
+#setup-row { margin-top: 14px; }
+
+#setup-result { display: flex; gap: 8px; margin-top: 8px; }
+#setup-result[hidden] { display: none; }
+
+#setup-link {
+  flex: 1;
+  min-width: 0;
+  font-size: 14px;
+  padding: 12px 14px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  background: var(--panel-2);
+  color: var(--text);
+}
+
+#setup-hint { font-size: 13px; line-height: 1.4; margin: 10px 0 0; }
