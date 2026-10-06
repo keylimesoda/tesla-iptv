@@ -1,0 +1,390 @@
+declare global {
+  interface Window {
+    LibAV?: {
+      base?: string;
+      LibAV?: (opts?: Record<string, unknown>) => Promise<any>;
+    };
+  }
+}
+
+let libavLoader: Promise<void> | null = null;
+
+function loadLibAV(): Promise<void> {
+  if (window.LibAV?.LibAV) return Promise.resolve();
+  if (libavLoader) return libavLoader;
+
+  const base = `${location.origin}${import.meta.env.BASE_URL}libav-h264`;
+  window.LibAV = { base };
+  libavLoader = new Promise<void>((resolve, reject) => {
+    const script = document.createElement("script");
+    script.src = `${base}/libav-6.10.9.0-h264-poc.js`;
+    script.onload = () => resolve();
+    script.onerror = () => reject(new Error("Could not load libav.js H.264 runtime"));
+    document.head.append(script);
+  });
+  return libavLoader;
+}
+
+function sleep(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+function emitStatus(detail: Record<string, unknown>): void {
+  window.dispatchEvent(new CustomEvent("wasm:status", { detail }));
+}
+
+class YuvRenderer {
+  private gl: WebGLRenderingContext;
+  private program: WebGLProgram;
+  private textures: WebGLTexture[];
+  private textureSizes: Array<[number, number] | null> = [null, null, null];
+
+  constructor(private canvas: HTMLCanvasElement) {
+    const gl = canvas.getContext("webgl", {
+      alpha: false,
+      antialias: false,
+      preserveDrawingBuffer: false,
+    });
+    if (!gl) throw new Error("WebGL unavailable");
+    this.gl = gl;
+
+    const vertex = `
+      attribute vec2 aPos;
+      varying vec2 vUV;
+      void main() {
+        vUV = (aPos + 1.0) * 0.5;
+        vUV.y = 1.0 - vUV.y;
+        gl_Position = vec4(aPos, 0.0, 1.0);
+      }
+    `;
+    const fragment = `
+      precision mediump float;
+      varying vec2 vUV;
+      uniform sampler2D yTex;
+      uniform sampler2D uTex;
+      uniform sampler2D vTex;
+      void main() {
+        float y = texture2D(yTex, vUV).r;
+        float u = texture2D(uTex, vUV).r - 0.5;
+        float v = texture2D(vTex, vUV).r - 0.5;
+        gl_FragColor = vec4(
+          y + 1.402 * v,
+          y - 0.344136 * u - 0.714136 * v,
+          y + 1.772 * u,
+          1.0
+        );
+      }
+    `;
+
+    const shader = (type: number, source: string): WebGLShader => {
+      const out = gl.createShader(type);
+      if (!out) throw new Error("Could not create WebGL shader");
+      gl.shaderSource(out, source);
+      gl.compileShader(out);
+      if (!gl.getShaderParameter(out, gl.COMPILE_STATUS)) {
+        throw new Error(gl.getShaderInfoLog(out) || "WebGL shader compile failed");
+      }
+      return out;
+    };
+
+    const program = gl.createProgram();
+    if (!program) throw new Error("Could not create WebGL program");
+    gl.attachShader(program, shader(gl.VERTEX_SHADER, vertex));
+    gl.attachShader(program, shader(gl.FRAGMENT_SHADER, fragment));
+    gl.linkProgram(program);
+    if (!gl.getProgramParameter(program, gl.LINK_STATUS)) {
+      throw new Error(gl.getProgramInfoLog(program) || "WebGL program link failed");
+    }
+    this.program = program;
+    gl.useProgram(program);
+
+    const buffer = gl.createBuffer();
+    if (!buffer) throw new Error("Could not create WebGL buffer");
+    gl.bindBuffer(gl.ARRAY_BUFFER, buffer);
+    gl.bufferData(
+      gl.ARRAY_BUFFER,
+      new Float32Array([-1, -1, 1, -1, -1, 1, 1, 1]),
+      gl.STATIC_DRAW,
+    );
+    const pos = gl.getAttribLocation(program, "aPos");
+    gl.enableVertexAttribArray(pos);
+    gl.vertexAttribPointer(pos, 2, gl.FLOAT, false, 0, 0);
+
+    const makeTexture = (unit: number, name: string): WebGLTexture => {
+      const tex = gl.createTexture();
+      if (!tex) throw new Error("Could not create WebGL texture");
+      gl.activeTexture(gl.TEXTURE0 + unit);
+      gl.bindTexture(gl.TEXTURE_2D, tex);
+      gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.LINEAR);
+      gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.LINEAR);
+      gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
+      gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
+      gl.uniform1i(gl.getUniformLocation(program, name), unit);
+      return tex;
+    };
+
+    this.textures = [
+      makeTexture(0, "yTex"),
+      makeTexture(1, "uTex"),
+      makeTexture(2, "vTex"),
+    ];
+    gl.pixelStorei(gl.UNPACK_ALIGNMENT, 1);
+  }
+
+  private plane(frame: any, index: number, width: number, height: number): Uint8Array {
+    const layout = frame.layout?.[index];
+    if (!layout) throw new Error(`Decoded frame is missing YUV plane ${index}`);
+    if (layout.stride === width) {
+      return frame.data.subarray(layout.offset, layout.offset + width * height);
+    }
+    const out = new Uint8Array(width * height);
+    for (let y = 0; y < height; y++) {
+      out.set(
+        frame.data.subarray(
+          layout.offset + y * layout.stride,
+          layout.offset + y * layout.stride + width,
+        ),
+        y * width,
+      );
+    }
+    return out;
+  }
+
+  private upload(unit: number, width: number, height: number, data: Uint8Array): void {
+    const gl = this.gl;
+    gl.activeTexture(gl.TEXTURE0 + unit);
+    gl.bindTexture(gl.TEXTURE_2D, this.textures[unit]);
+    const old = this.textureSizes[unit];
+    if (!old || old[0] !== width || old[1] !== height) {
+      gl.texImage2D(
+        gl.TEXTURE_2D,
+        0,
+        gl.LUMINANCE,
+        width,
+        height,
+        0,
+        gl.LUMINANCE,
+        gl.UNSIGNED_BYTE,
+        data,
+      );
+      this.textureSizes[unit] = [width, height];
+    } else {
+      gl.texSubImage2D(
+        gl.TEXTURE_2D,
+        0,
+        0,
+        0,
+        width,
+        height,
+        gl.LUMINANCE,
+        gl.UNSIGNED_BYTE,
+        data,
+      );
+    }
+  }
+
+  render(frame: any): void {
+    if (frame.format !== 0) {
+      throw new Error(`WASM beta currently requires YUV420P; decoder returned pixel format ${frame.format}`);
+    }
+
+    const width = frame.width as number;
+    const height = frame.height as number;
+    const cw = width >> 1;
+    const ch = height >> 1;
+
+    this.upload(0, width, height, this.plane(frame, 0, width, height));
+    this.upload(1, cw, ch, this.plane(frame, 1, cw, ch));
+    this.upload(2, cw, ch, this.plane(frame, 2, cw, ch));
+
+    const cssWidth = Math.max(1, this.canvas.clientWidth);
+    const cssHeight = Math.max(1, this.canvas.clientHeight);
+    const dpr = Math.min(window.devicePixelRatio || 1, 2);
+    const pixelWidth = Math.round(cssWidth * dpr);
+    const pixelHeight = Math.round(cssHeight * dpr);
+    if (this.canvas.width !== pixelWidth || this.canvas.height !== pixelHeight) {
+      this.canvas.width = pixelWidth;
+      this.canvas.height = pixelHeight;
+    }
+
+    const gl = this.gl;
+    gl.clearColor(0, 0, 0, 1);
+    gl.clear(gl.COLOR_BUFFER_BIT);
+
+    const scale = Math.min(pixelWidth / width, pixelHeight / height);
+    const outWidth = Math.round(width * scale);
+    const outHeight = Math.round(height * scale);
+    const x = Math.floor((pixelWidth - outWidth) / 2);
+    const y = Math.floor((pixelHeight - outHeight) / 2);
+    gl.viewport(x, y, outWidth, outHeight);
+    gl.useProgram(this.program);
+    gl.drawArrays(gl.TRIANGLE_STRIP, 0, 4);
+  }
+
+  clear(): void {
+    const gl = this.gl;
+    gl.viewport(0, 0, this.canvas.width, this.canvas.height);
+    gl.clearColor(0, 0, 0, 1);
+    gl.clear(gl.COLOR_BUFFER_BIT);
+  }
+}
+
+export class WasmHlsPlayer {
+  private renderer: YuvRenderer | null = null;
+  private libav: any = null;
+  private generation = 0;
+  private isPaused = false;
+  private lastFrameTime = 0;
+  private decodeFrames = 0;
+  private decodeStarted = 0;
+
+  constructor(private canvas: HTMLCanvasElement) {}
+
+  get paused(): boolean {
+    return this.isPaused;
+  }
+
+  play(): void {
+    this.isPaused = false;
+  }
+
+  pause(): void {
+    this.isPaused = true;
+  }
+
+  toggle(): void {
+    this.isPaused = !this.isPaused;
+  }
+
+  stop(): void {
+    this.generation++;
+    this.isPaused = false;
+    this.renderer?.clear();
+    if (this.libav?.terminate) {
+      try {
+        this.libav.terminate();
+      } catch {
+        // Best-effort worker cleanup.
+      }
+    }
+    this.libav = null;
+  }
+
+  async load(url: string): Promise<void> {
+    this.stop();
+    const generation = this.generation;
+    emitStatus({ message: "WASM beta: loading decoder…" });
+
+    await loadLibAV();
+    if (generation !== this.generation) return;
+
+    const factory = window.LibAV?.LibAV;
+    if (!factory) throw new Error("libav.js loaded without LibAV factory");
+
+    this.renderer ??= new YuvRenderer(this.canvas);
+    const libav = await factory();
+    if (generation !== this.generation) {
+      libav.terminate?.();
+      return;
+    }
+    this.libav = libav;
+
+    emitStatus({ message: "WASM beta: opening HLS stream…" });
+    const [formatContext, streams] = await libav.ff_init_demuxer_file(`jsfetch:${url}`);
+    if (generation !== this.generation) return;
+
+    let videoIndex = -1;
+    for (let i = 0; i < streams.length; i++) {
+      if (streams[i].codec_type === libav.AVMEDIA_TYPE_VIDEO) {
+        videoIndex = i;
+        break;
+      }
+    }
+    if (videoIndex < 0) throw new Error("No video stream found in HLS source");
+
+    const stream = streams[videoIndex];
+    const [, codecContext, packet, frame] = await libav.ff_init_decoder(
+      stream.codec_id,
+      stream.codecpar,
+    );
+
+    this.decodeFrames = 0;
+    this.decodeStarted = performance.now();
+    this.lastFrameTime = 0;
+    let basePts: number | null = null;
+    let baseWall = performance.now();
+
+    emitStatus({ message: "WASM beta: decoding H.264…", width: stream.codecpar?.width, height: stream.codecpar?.height });
+
+    while (generation === this.generation) {
+      while (this.isPaused && generation === this.generation) await sleep(50);
+      if (generation !== this.generation) break;
+
+      const [result, packets] = await libav.ff_read_frame_multi(
+        formatContext,
+        packet,
+        { limit: 512 * 1024 },
+      );
+      if (generation !== this.generation) break;
+
+      const videoPackets = packets[videoIndex] || [];
+      const frames = await libav.ff_decode_multi(
+        codecContext,
+        packet,
+        frame,
+        videoPackets,
+        {
+          fin: result === libav.AVERROR_EOF,
+          copyoutFrame: "video",
+        },
+      );
+
+      for (const decoded of frames) {
+        if (generation !== this.generation) break;
+        while (this.isPaused && generation === this.generation) await sleep(50);
+        if (generation !== this.generation) break;
+
+        const pts = Number.isFinite(decoded.best_effort_timestamp)
+          ? decoded.best_effort_timestamp
+          : decoded.pts;
+        const tbNum = decoded.time_base_num || stream.time_base_num;
+        const tbDen = decoded.time_base_den || stream.time_base_den;
+        const seconds = Number.isFinite(pts) && tbNum && tbDen ? pts * tbNum / tbDen : NaN;
+
+        if (Number.isFinite(seconds)) {
+          if (basePts === null) {
+            basePts = seconds;
+            baseWall = performance.now();
+          }
+          let wait = baseWall + (seconds - basePts) * 1000 - performance.now();
+          if (wait < -1500 || wait > 5000) {
+            basePts = seconds;
+            baseWall = performance.now();
+            wait = 0;
+          }
+          if (wait > 1) await sleep(Math.min(wait, 1000));
+        }
+
+        this.renderer.render(decoded);
+        this.decodeFrames++;
+        this.lastFrameTime = performance.now();
+
+        if (this.decodeFrames === 1 || this.decodeFrames % 30 === 0) {
+          const elapsed = Math.max(0.001, (performance.now() - this.decodeStarted) / 1000);
+          emitStatus({
+            message: `WASM beta · ${decoded.width}×${decoded.height} · ${(this.decodeFrames / elapsed).toFixed(1)} decoded fps · video only`,
+            frames: this.decodeFrames,
+            width: decoded.width,
+            height: decoded.height,
+            decodeFps: this.decodeFrames / elapsed,
+          });
+        }
+      }
+
+      if (result === libav.AVERROR_EOF) {
+        emitStatus({ message: "WASM beta: stream ended" });
+        break;
+      }
+    }
+  }
+}
