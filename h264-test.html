@@ -121,7 +121,7 @@ async function runTest(){
   while(true){
     const [res,packets]=await libav.ff_read_multi(fmt,pkt,null,{limit:1024*1024});
     const vp=packets[vi]||[];
-    const fs=await libav.ff_decode_multi(ctx,pkt,frame,vp,{fin:res===libav.AVERROR_EOF,copyoutFrame:'video_packed'});
+    const fs=await libav.ff_decode_multi(ctx,pkt,frame,vp,{fin:res===libav.AVERROR_EOF,copyoutFrame:'video'});
     decoded.push(...fs);
     $('frames').textContent=String(decoded.length);
     if(res===libav.AVERROR_EOF)break;
