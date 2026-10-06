@@ -293,14 +293,28 @@ export class WasmHlsPlayer {
     const [formatContext, streams] = await libav.ff_init_demuxer_file(`jsfetch:${url}`);
     if (generation !== this.generation) return;
 
+    // AVMEDIA_TYPE_VIDEO is 0 in FFmpeg. Some libav.js worker builds do not
+    // reflect enum constants back onto the proxy object, so do not depend on
+    // the constant being present.
+    const videoType = typeof libav.AVMEDIA_TYPE_VIDEO === "number"
+      ? libav.AVMEDIA_TYPE_VIDEO
+      : 0;
+    const streamSummary = streams
+      .map((s: any, i: number) => `${i}:type=${s.codec_type},codec=${s.codec_id}`)
+      .join(" ");
+
     let videoIndex = -1;
     for (let i = 0; i < streams.length; i++) {
-      if (streams[i].codec_type === libav.AVMEDIA_TYPE_VIDEO) {
+      if (Number(streams[i].codec_type) === videoType) {
         videoIndex = i;
         break;
       }
     }
-    if (videoIndex < 0) throw new Error("No video stream found in HLS source");
+    if (videoIndex < 0) {
+      throw new Error(
+        `No video stream found (videoType=${videoType}; streams=${streamSummary || "none"})`,
+      );
+    }
 
     const stream = streams[videoIndex];
     const [, codecContext, packet, frame] = await libav.ff_init_decoder(
