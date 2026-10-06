@@ -1,5 +1,6 @@
 import { fetchM3U, groupByGroup, type Channel } from "./iptv";
 import { Player } from "./player";
+import { WasmHlsPlayer } from "./wasm-player";
 
 const $ = <T extends Element>(sel: string): T => document.querySelector(sel) as T;
 
@@ -14,12 +15,15 @@ const els = {
   count: $<HTMLElement>("#count"),
   video: $<HTMLVideoElement>("#video"),
   canvas: $<HTMLCanvasElement>("#canvas"),
+  wasmCanvas: $<HTMLCanvasElement>("#wasm-canvas"),
   bigPlay: $<HTMLButtonElement>("#big-play"),
   play: $<HTMLButtonElement>("#play"),
   playPath: $<SVGPathElement>("#play-icon path"),
   channelName: $<HTMLElement>("#channel-name"),
   channelSub: $<HTMLElement>("#channel-sub"),
   canvasMode: $<HTMLInputElement>("#canvas-mode"),
+  wasmMode: $<HTMLInputElement>("#wasm-mode"),
+  wasmToggle: $<HTMLElement>("#wasm-toggle"),
   mute: $<HTMLButtonElement>("#mute"),
   muteWaves: $<SVGPathElement>("#mute-waves"),
   fullscreen: $<HTMLButtonElement>("#fullscreen"),
@@ -37,9 +41,13 @@ const els = {
 
 const LS_M3U = "tesla-iptv.m3u-url";
 const LS_MODE = "tesla-iptv.render-mode";
+const LS_WASM = "tesla-iptv.wasm-beta";
 const DEFAULT_M3U = `${import.meta.env.BASE_URL}channels.m3u`;
 
 const player = new Player(els.video, els.canvas);
+const wasmPlayer = new WasmHlsPlayer(els.wasmCanvas);
+let wasmActive = false;
+let currentChannel: Channel | null = null;
 let channels: Channel[] = [];
 const collapsedGroups = new Set<string>();
 
@@ -130,25 +138,67 @@ function renderList(filter: string): void {
   els.count.textContent = shown ? `${shown} ch` : "";
 }
 
+function channelSubLabel(ch: Channel): string {
+  return ch.group && ch.group !== "General" ? ch.group : "live";
+}
+
+function applyLegacyMode(): void {
+  const saved = (localStorage.getItem(LS_MODE) as "video" | "canvas" | null) ?? "canvas";
+  els.canvasMode.checked = saved === "canvas";
+  player.setMode(saved === "canvas" ? "canvas" : "video");
+}
+
+function setWasmUi(enabled: boolean): void {
+  wasmActive = enabled;
+  els.wasmMode.checked = enabled;
+  els.wasmCanvas.classList.toggle("active", enabled);
+  els.stage.classList.toggle("wasm-active", enabled);
+  els.canvasMode.disabled = enabled;
+  els.mute.disabled = enabled;
+}
+
+function startWasm(ch: Channel): void {
+  player.stop();
+  setWasmUi(true);
+  els.channelSub.textContent = "WASM beta · starting…";
+  void wasmPlayer.load(ch.url).catch((err) => {
+    if (!wasmActive) return;
+    const msg = err instanceof Error ? err.message : String(err);
+    els.channelSub.textContent = `WASM error · ${msg}`;
+    window.dispatchEvent(new CustomEvent("player:error", { detail: { message: msg } }));
+  });
+}
+
+function startLegacy(ch: Channel): void {
+  wasmPlayer.stop();
+  setWasmUi(false);
+  els.channelSub.textContent = channelSubLabel(ch);
+  applyLegacyMode();
+  player.load(ch.url);
+  updateMuteUI();
+}
+
 function showPlayer(ch: Channel): void {
+  currentChannel = ch;
   els.title.textContent = ch.name;
   els.channelName.textContent = ch.name;
-  els.channelSub.textContent = ch.group && ch.group !== "General" ? ch.group : "live";
+  els.channelSub.textContent = channelSubLabel(ch);
   els.listView.hidden = true;
   els.playerView.hidden = false;
   els.back.hidden = false;
 
-  const saved = (localStorage.getItem(LS_MODE) as "video" | "canvas" | null) ?? "canvas";
-  els.canvasMode.checked = saved === "canvas";
-  player.setMode(saved === "canvas" ? "canvas" : "video");
+  const useWasm = localStorage.getItem(LS_WASM) === "1";
+  if (useWasm) startWasm(ch);
+  else startLegacy(ch);
 
-  player.load(ch.url);
   updatePlayUI();
-  updateMuteUI();
 }
 
 function showList(): void {
   player.stop();
+  wasmPlayer.stop();
+  currentChannel = null;
+  setWasmUi(false);
   els.playerView.hidden = true;
   els.listView.hidden = false;
   els.back.hidden = true;
@@ -159,7 +209,7 @@ const ICON_PLAY = "M8 5v14l11-7z";
 const ICON_PAUSE = "M6 5h4v14H6zM14 5h4v14h-4z";
 
 function updatePlayUI(): void {
-  const paused = player.paused;
+  const paused = wasmActive ? wasmPlayer.paused : player.paused;
   els.playPath.setAttribute("d", paused ? ICON_PLAY : ICON_PAUSE);
   els.bigPlay.hidden = !paused;
 }
@@ -174,22 +224,38 @@ els.search.addEventListener("input", () => renderList(els.search.value));
 els.back.addEventListener("click", showList);
 
 els.bigPlay.addEventListener("click", () => {
-  player.play();
+  if (wasmActive) wasmPlayer.play();
+  else player.play();
   updatePlayUI();
 });
 
 els.play.addEventListener("click", () => {
-  player.toggle();
+  if (wasmActive) wasmPlayer.toggle();
+  else player.toggle();
   updatePlayUI();
 });
 
 els.canvasMode.addEventListener("change", () => {
+  if (wasmActive) return;
   const mode = els.canvasMode.checked ? "canvas" : "video";
   player.setMode(mode);
   localStorage.setItem(LS_MODE, mode);
 });
 
+els.wasmMode.addEventListener("change", () => {
+  const enabled = els.wasmMode.checked;
+  localStorage.setItem(LS_WASM, enabled ? "1" : "0");
+  if (!currentChannel) {
+    setWasmUi(enabled);
+    return;
+  }
+  if (enabled) startWasm(currentChannel);
+  else startLegacy(currentChannel);
+  updatePlayUI();
+});
+
 els.mute.addEventListener("click", () => {
+  if (wasmActive) return;
   player.setMuted(!player.muted);
   updateMuteUI();
 });
@@ -206,6 +272,12 @@ els.video.addEventListener("volumechange", updateMuteUI);
 window.addEventListener("player:error", (e) => {
   const detail = (e as CustomEvent).detail as { message?: string } | undefined;
   setStatus(`Playback error: ${detail?.message ?? "stream failed"}`);
+});
+
+window.addEventListener("wasm:status", (e) => {
+  if (!wasmActive) return;
+  const detail = (e as CustomEvent).detail as { message?: string } | undefined;
+  if (detail?.message) els.channelSub.textContent = detail.message;
 });
 
 // --- settings sheet ---
