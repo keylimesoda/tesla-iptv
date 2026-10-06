@@ -46,10 +46,6 @@ jobs:
           cd configs
           ./mkconfig.js h264-poc '["demuxer-mp4","parser-h264","decoder-h264"]'
 
-      - name: Extract libav.js dependencies
-        working-directory: libavjs
-        run: make extract
-
       - name: Build minimal H.264 WebAssembly target
         working-directory: libavjs
         run: |
