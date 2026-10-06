@@ -1,0 +1,190 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
+<title>WebGL YUV420 Render Test</title>
+<style>
+  :root { color-scheme: dark; font-family: system-ui,-apple-system,Segoe UI,sans-serif; }
+  body { margin:0; background:#111; color:#eee; }
+  main { max-width:900px; margin:0 auto; padding:16px; }
+  h1 { font-size:22px; margin:0 0 8px; }
+  p { color:#bbb; margin:6px 0 14px; }
+  canvas { width:100%; aspect-ratio:16/9; display:block; background:#000; border:1px solid #444; }
+  .grid { display:grid; grid-template-columns:repeat(auto-fit,minmax(180px,1fr)); gap:8px; margin-top:12px; }
+  .card { background:#1b1b1b; border:1px solid #333; border-radius:8px; padding:10px; }
+  .label { color:#999; font-size:12px; text-transform:uppercase; letter-spacing:.04em; }
+  .value { font:600 16px ui-monospace,SFMono-Regular,Consolas,monospace; word-break:break-word; margin-top:4px; }
+  button { margin-top:12px; padding:10px 14px; font-size:16px; }
+  #log { white-space:pre-wrap; font:13px ui-monospace,SFMono-Regular,Consolas,monospace; color:#aaa; margin-top:12px; }
+</style>
+</head>
+<body>
+<main>
+  <h1>WebGL YUV420 Rendering Diagnostic</h1>
+  <p>Synthetic YUV420 frames only. No &lt;video&gt;, MediaSource, WebCodecs, audio, or network media.</p>
+  <canvas id="c" width="640" height="360"></canvas>
+  <div class="grid">
+    <div class="card"><div class="label">Status</div><div class="value" id="status">starting…</div></div>
+    <div class="card"><div class="label">FPS</div><div class="value" id="fps">—</div></div>
+    <div class="card"><div class="label">Frames</div><div class="value" id="frames">0</div></div>
+    <div class="card"><div class="label">WebGL</div><div class="value" id="webgl">—</div></div>
+    <div class="card"><div class="label">Renderer</div><div class="value" id="renderer">—</div></div>
+    <div class="card"><div class="label">Max texture</div><div class="value" id="maxtex">—</div></div>
+  </div>
+  <button id="toggle">Stop</button>
+  <div id="log"></div>
+</main>
+<script>
+(() => {
+  const W=640,H=360,UW=W>>1,UH=H>>1;
+  const canvas=document.getElementById('c');
+  const $=id=>document.getElementById(id);
+  const log=s=>{$('log').textContent += s + '\n';};
+
+  const gl=canvas.getContext('webgl',{alpha:false,antialias:false,preserveDrawingBuffer:false});
+  if(!gl){
+    $('status').textContent='FAIL: WebGL unavailable';
+    $('toggle').disabled=true;
+    return;
+  }
+
+  $('webgl').textContent=gl.getParameter(gl.VERSION);
+  $('maxtex').textContent=String(gl.getParameter(gl.MAX_TEXTURE_SIZE));
+  const dbg=gl.getExtension('WEBGL_debug_renderer_info');
+  $('renderer').textContent=dbg ? gl.getParameter(dbg.UNMASKED_RENDERER_WEBGL) : gl.getParameter(gl.RENDERER);
+
+  const vsSrc=`
+    attribute vec2 aPos;
+    varying vec2 vUV;
+    void main(){
+      vUV=(aPos+1.0)*0.5;
+      vUV.y=1.0-vUV.y;
+      gl_Position=vec4(aPos,0.0,1.0);
+    }`;
+  const fsSrc=`
+    precision mediump float;
+    varying vec2 vUV;
+    uniform sampler2D yTex;
+    uniform sampler2D uTex;
+    uniform sampler2D vTex;
+    void main(){
+      float y=texture2D(yTex,vUV).r;
+      float u=texture2D(uTex,vUV).r-0.5;
+      float v=texture2D(vTex,vUV).r-0.5;
+      float r=y+1.402*v;
+      float g=y-0.344136*u-0.714136*v;
+      float b=y+1.772*u;
+      gl_FragColor=vec4(r,g,b,1.0);
+    }`;
+
+  function shader(type,src){
+    const s=gl.createShader(type);
+    gl.shaderSource(s,src); gl.compileShader(s);
+    if(!gl.getShaderParameter(s,gl.COMPILE_STATUS)) throw new Error(gl.getShaderInfoLog(s)||'shader compile failed');
+    return s;
+  }
+  function program(){
+    const p=gl.createProgram();
+    gl.attachShader(p,shader(gl.VERTEX_SHADER,vsSrc));
+    gl.attachShader(p,shader(gl.FRAGMENT_SHADER,fsSrc));
+    gl.linkProgram(p);
+    if(!gl.getProgramParameter(p,gl.LINK_STATUS)) throw new Error(gl.getProgramInfoLog(p)||'program link failed');
+    return p;
+  }
+
+  let prog;
+  try { prog=program(); }
+  catch(e){ $('status').textContent='FAIL: shader'; log(String(e)); return; }
+
+  gl.useProgram(prog);
+  const buf=gl.createBuffer();
+  gl.bindBuffer(gl.ARRAY_BUFFER,buf);
+  gl.bufferData(gl.ARRAY_BUFFER,new Float32Array([-1,-1, 1,-1, -1,1, 1,1]),gl.STATIC_DRAW);
+  const aPos=gl.getAttribLocation(prog,'aPos');
+  gl.enableVertexAttribArray(aPos);
+  gl.vertexAttribPointer(aPos,2,gl.FLOAT,false,0,0);
+
+  function makeTex(unit,w,h,data,name){
+    const tex=gl.createTexture();
+    gl.activeTexture(gl.TEXTURE0+unit);
+    gl.bindTexture(gl.TEXTURE_2D,tex);
+    gl.pixelStorei(gl.UNPACK_ALIGNMENT,1);
+    gl.texParameteri(gl.TEXTURE_2D,gl.TEXTURE_MIN_FILTER,gl.LINEAR);
+    gl.texParameteri(gl.TEXTURE_2D,gl.TEXTURE_MAG_FILTER,gl.LINEAR);
+    gl.texParameteri(gl.TEXTURE_2D,gl.TEXTURE_WRAP_S,gl.CLAMP_TO_EDGE);
+    gl.texParameteri(gl.TEXTURE_2D,gl.TEXTURE_WRAP_T,gl.CLAMP_TO_EDGE);
+    gl.texImage2D(gl.TEXTURE_2D,0,gl.LUMINANCE,w,h,0,gl.LUMINANCE,gl.UNSIGNED_BYTE,data);
+    gl.uniform1i(gl.getUniformLocation(prog,name),unit);
+    return tex;
+  }
+
+  const y=new Uint8Array(W*H), u=new Uint8Array(UW*UH), v=new Uint8Array(UW*UH);
+  u.fill(128); v.fill(128);
+  const yT=makeTex(0,W,H,y,'yTex');
+  const uT=makeTex(1,UW,UH,u,'uTex');
+  const vT=makeTex(2,UW,UH,v,'vTex');
+
+  function synth(t){
+    const phase=(t*0.05)|0;
+    for(let yy=0;yy<H;yy++){
+      const row=yy*W;
+      for(let x=0;x<W;x++){
+        const bars=((x+phase)>>5)&7;
+        y[row+x]=24 + bars*28;
+      }
+    }
+    for(let yy=0;yy<UH;yy++){
+      const row=yy*UW;
+      for(let x=0;x<UW;x++){
+        u[row+x]=128 + Math.round(50*Math.sin((x+phase)*0.025));
+        v[row+x]=128 + Math.round(50*Math.cos((yy+phase)*0.035));
+      }
+    }
+  }
+  function upload(unit,tex,w,h,data){
+    gl.activeTexture(gl.TEXTURE0+unit);
+    gl.bindTexture(gl.TEXTURE_2D,tex);
+    gl.texSubImage2D(gl.TEXTURE_2D,0,0,0,w,h,gl.LUMINANCE,gl.UNSIGNED_BYTE,data);
+  }
+
+  let running=true, frame=0, last=performance.now(), windowStart=last, windowFrames=0, raf=0;
+  function loop(now){
+    if(!running) return;
+    synth(now);
+    upload(0,yT,W,H,y); upload(1,uT,UW,UH,u); upload(2,vT,UW,UH,v);
+    gl.viewport(0,0,canvas.width,canvas.height);
+    gl.drawArrays(gl.TRIANGLE_STRIP,0,4);
+
+    frame++; windowFrames++;
+    $('frames').textContent=String(frame);
+
+    const dt=now-windowStart;
+    if(dt>=1000){
+      const fps=windowFrames*1000/dt;
+      $('fps').textContent=fps.toFixed(1);
+      $('status').textContent=fps>=20 ? 'PASS' : fps>=5 ? 'PASS (slow)' : 'LOW FPS';
+      windowStart=now; windowFrames=0;
+    }
+    raf=requestAnimationFrame(loop);
+  }
+
+  canvas.addEventListener('webglcontextlost',e=>{
+    e.preventDefault(); running=false; $('status').textContent='FAIL: context lost'; log('webglcontextlost');
+  });
+
+  $('toggle').addEventListener('click',()=>{
+    running=!running;
+    $('toggle').textContent=running?'Stop':'Start';
+    if(running){ windowStart=performance.now(); windowFrames=0; raf=requestAnimationFrame(loop); }
+    else cancelAnimationFrame(raf);
+  });
+
+  log('User agent: '+navigator.userAgent);
+  log('Canvas: '+W+'x'+H+'; YUV420 texture upload + fragment-shader conversion');
+  $('status').textContent='RUNNING';
+  raf=requestAnimationFrame(loop);
+})();
+</script>
+</body>
+</html>
