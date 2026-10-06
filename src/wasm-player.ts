@@ -33,6 +33,78 @@ function emitStatus(detail: Record<string, unknown>): void {
   window.dispatchEvent(new CustomEvent("wasm:status", { detail }));
 }
 
+
+type HlsProbe = {
+  url: string;
+  kind: "master" | "media" | "unknown";
+  status: number;
+  contentType: string;
+  variants: Array<{ url: string; bandwidth: number; codecs: string }>;
+};
+
+async function probePlaylist(url: string): Promise<HlsProbe> {
+  const response = await fetch(url, { cache: "no-store" });
+  if (!response.ok) {
+    throw new Error(`playlist HTTP ${response.status}`);
+  }
+  const text = await response.text();
+  const contentType = response.headers.get("content-type") || "";
+  const lines = text.split(/\r?\n/).map((line) => line.trim()).filter(Boolean);
+
+  const variants: Array<{ url: string; bandwidth: number; codecs: string }> = [];
+  for (let i = 0; i < lines.length; i++) {
+    if (!lines[i].startsWith("#EXT-X-STREAM-INF:")) continue;
+    const attrs = lines[i].slice("#EXT-X-STREAM-INF:".length);
+    const bw = Number(attrs.match(/(?:^|,)BANDWIDTH=(\d+)/)?.[1] || 0);
+    const codecs = attrs.match(/(?:^|,)CODECS="([^"]*)"/)?.[1] || "";
+    const uri = lines.slice(i + 1).find((line) => !line.startsWith("#"));
+    if (uri) variants.push({ url: new URL(uri, response.url || url).href, bandwidth: bw, codecs });
+  }
+
+  const kind: HlsProbe["kind"] = variants.length
+    ? "master"
+    : lines.some((line) => line.startsWith("#EXTINF") || line.startsWith("#EXT-X-TARGETDURATION"))
+      ? "media"
+      : "unknown";
+
+  return { url: response.url || url, kind, status: response.status, contentType, variants };
+}
+
+async function resolveH264MediaPlaylist(url: string): Promise<{ url: string; diagnostic: string }> {
+  let current = url;
+  const trail: string[] = [];
+
+  for (let depth = 0; depth < 3; depth++) {
+    const probe = await probePlaylist(current);
+    trail.push(`${probe.kind} HTTP ${probe.status}${probe.contentType ? ` ${probe.contentType.split(";")[0]}` : ""}`);
+
+    if (probe.kind !== "master") {
+      return { url: probe.url, diagnostic: trail.join(" → ") };
+    }
+
+    const explicitlyH264 = probe.variants.filter((v) => /(?:^|,)(?:avc1|avc3)\./i.test(v.codecs));
+    const candidates = explicitlyH264.length ? explicitlyH264 : probe.variants;
+    candidates.sort((a, b) => {
+      const abw = a.bandwidth || Number.MAX_SAFE_INTEGER;
+      const bbw = b.bandwidth || Number.MAX_SAFE_INTEGER;
+      return abw - bbw;
+    });
+
+    const selected = candidates[0];
+    if (!selected) throw new Error("master playlist contains no variants");
+
+    const allCodecsKnown = probe.variants.every((v) => v.codecs);
+    if (!explicitlyH264.length && allCodecsKnown) {
+      const codecs = Array.from(new Set(probe.variants.map((v) => v.codecs))).join(" | ");
+      throw new Error(`master playlist has no H.264 variant (CODECS: ${codecs})`);
+    }
+
+    current = selected.url;
+  }
+
+  throw new Error("HLS master playlist nesting is deeper than expected");
+}
+
 class YuvRenderer {
   private gl: WebGLRenderingContext;
   private program: WebGLProgram;
@@ -282,15 +354,29 @@ export class WasmHlsPlayer {
     if (!factory) throw new Error("libav.js loaded without LibAV factory");
 
     this.renderer ??= new YuvRenderer(this.canvas);
-    const libav = await factory();
+    // Match the standalone diagnostic's known-good execution mode for now.
+    // Worker mode can be re-enabled after HLS compatibility is proven.
+    const libav = await factory({ noworker: true });
     if (generation !== this.generation) {
       libav.terminate?.();
       return;
     }
     this.libav = libav;
 
-    emitStatus({ message: "WASM beta: opening HLS stream…" });
-    const [formatContext, streams] = await libav.ff_init_demuxer_file(`jsfetch:${url}`);
+    emitStatus({ message: "WASM beta: probing HLS playlist…" });
+    let mediaUrl = url;
+    let hlsDiagnostic = "probe unavailable";
+    try {
+      const resolved = await resolveH264MediaPlaylist(url);
+      mediaUrl = resolved.url;
+      hlsDiagnostic = resolved.diagnostic;
+      emitStatus({ message: `WASM beta: ${hlsDiagnostic} · opening media playlist…` });
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      throw new Error(`HLS probe failed: ${msg}`);
+    }
+
+    const [formatContext, streams] = await libav.ff_init_demuxer_file(`jsfetch:${mediaUrl}`);
     if (generation !== this.generation) return;
 
     // AVMEDIA_TYPE_VIDEO is 0 in FFmpeg. Some libav.js worker builds do not
@@ -312,7 +398,7 @@ export class WasmHlsPlayer {
     }
     if (videoIndex < 0) {
       throw new Error(
-        `No video stream found (videoType=${videoType}; streams=${streamSummary || "none"})`,
+        `No video stream found (${hlsDiagnostic}; videoType=${videoType}; streams=${streamSummary || "none"})`,
       );
     }
 
