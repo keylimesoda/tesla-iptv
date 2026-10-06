@@ -6,7 +6,13 @@ on:
     branches: [main]
     paths:
       - ".github/workflows/build-h264-poc.yml"
-      - "public/h264-test.html"
+      - "index.html"
+      - "package.json"
+      - "package-lock.json"
+      - "vite.config.ts"
+      - "tsconfig.json"
+      - "src/**"
+      - "public/**"
 
 permissions:
   contents: write
@@ -23,13 +29,22 @@ jobs:
         with:
           node-version: "24"
 
+      - name: Install app dependencies
+        run: npm ci
+
+      - name: Type-check app
+        run: npx tsc --noEmit
+
+      - name: Build Vite app
+        run: npm run build
+
       - name: Set up Emscripten
         uses: mymindstorm/setup-emsdk@v16
         with:
           version: "6.0.5"
           actions-cache-folder: "cache-emsdk"
 
-      - name: Install build tools
+      - name: Install libav build tools
         run: |
           sudo apt-get update
           sudo apt-get install -y meson pkg-config ffmpeg
@@ -40,26 +55,32 @@ jobs:
           cd libavjs
           git checkout c05a676d16c1068cce6115594858c50a7ecad4b8
 
-      - name: Create decoder-only H.264 variant
+      - name: Create HLS H.264 variant
         working-directory: libavjs
         run: |
           cd configs
-          ./mkconfig.js h264-poc '["avformat","avcodec","demuxer-mp4","parser-h264","decoder-h264"]'
+          ./mkconfig.js h264-poc '["avformat","avcodec","protocol-jsfetch","demuxer-hls","demuxer-mp4","parser-h264","decoder-h264"]'
 
-      - name: Build minimal H.264 WebAssembly target
+      - name: Build H.264 WebAssembly target
         working-directory: libavjs
         run: |
-          make -j2             dist/libav-6.10.9.0-h264-poc.js             dist/libav-6.10.9.0-h264-poc.wasm.js
+          make -j2 \
+            dist/libav-6.10.9.0-h264-poc.js \
+            dist/libav-6.10.9.0-h264-poc.wasm.js
           test -f dist/libav-6.10.9.0-h264-poc.wasm.wasm
 
-      - name: Generate known H.264 test asset
+      - name: Prepare libav runtime and diagnostic asset
         run: |
           mkdir -p publish/libav-h264
-          ffmpeg -hide_banner -loglevel error             -f lavfi -i "testsrc2=size=640x360:rate=30"             -t 4 -an -c:v libx264 -preset veryfast             -profile:v baseline -level 3.0 -pix_fmt yuv420p             -movflags +faststart             publish/libav-h264/sample-h264.mp4
+          ffmpeg -hide_banner -loglevel error \
+            -f lavfi -i "testsrc2=size=640x360:rate=30" \
+            -t 4 -an -c:v libx264 -preset veryfast \
+            -profile:v baseline -level 3.0 -pix_fmt yuv420p \
+            -movflags +faststart \
+            publish/libav-h264/sample-h264.mp4
           cp libavjs/dist/libav-6.10.9.0-h264-poc.js publish/libav-h264/
           cp libavjs/dist/libav-6.10.9.0-h264-poc.wasm.js publish/libav-h264/
           cp libavjs/dist/libav-6.10.9.0-h264-poc.wasm.wasm publish/libav-h264/
-          cp public/h264-test.html publish/h264-test.html
 
       - name: Checkout gh-pages
         uses: actions/checkout@v4
@@ -67,17 +88,17 @@ jobs:
           ref: gh-pages
           path: site
 
-      - name: Publish diagnostic
+      - name: Publish app and WASM runtime
         run: |
-          rm -rf site/libav-h264
+          rm -rf site/assets site/libav-h264
+          cp -a dist/. site/
           mkdir -p site/libav-h264
-          cp publish/h264-test.html site/h264-test.html
           cp publish/libav-h264/* site/libav-h264/
           cd site
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git add h264-test.html libav-h264
+          git add -A
           if ! git diff --cached --quiet; then
-            git commit -m "diag: publish libav.js H264 WASM test"
+            git commit -m "build: publish IPTV WASM beta"
             git push origin gh-pages
           fi
