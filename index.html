@@ -37,6 +37,7 @@
         <div id="stage">
           <video id="video" playsinline preload="auto"></video>
           <canvas id="canvas"></canvas>
+          <canvas id="wasm-canvas"></canvas>
           <button id="big-play" aria-label="Play">
             <svg viewBox="0 0 24 24" width="88" height="88" aria-hidden="true"><path d="M8 5v14l11-7z" fill="currentColor"/></svg>
           </button>
@@ -50,9 +51,13 @@
             <div id="channel-sub" class="muted"></div>
           </div>
           <div id="ctl-right">
-            <label id="canvas-toggle" title="In-motion (canvas) rendering">
+            <label id="canvas-toggle" title="Legacy canvas rendering">
               <input type="checkbox" id="canvas-mode" />
-              <span>Canvas<br/>in-motion</span>
+              <span>Canvas<br/>legacy</span>
+            </label>
+            <label id="wasm-toggle" title="Experimental libav.js H.264/WebGL decoder" hidden>
+              <input type="checkbox" id="wasm-mode" />
+              <span>WASM<br/>beta</span>
             </label>
             <button id="mute" class="icon-btn" aria-label="Mute">
               <svg viewBox="0 0 24 24" width="28" height="28" aria-hidden="true"><path d="M4 9v6h4l5 5V4L8 9H4z" fill="currentColor"/><path id="mute-waves" d="M16.5 8.5a5 5 0 0 1 0 7M19 6a8 8 0 0 1 0 12" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"/></svg>
