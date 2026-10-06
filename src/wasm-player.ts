@@ -39,6 +39,7 @@ type HlsProbe = {
   kind: "master" | "media" | "unknown";
   status: number;
   contentType: string;
+  text: string;
   variants: Array<{ url: string; bandwidth: number; codecs: string }>;
 };
 
@@ -67,10 +68,10 @@ async function probePlaylist(url: string): Promise<HlsProbe> {
       ? "media"
       : "unknown";
 
-  return { url: response.url || url, kind, status: response.status, contentType, variants };
+  return { url: response.url || url, kind, status: response.status, contentType, text, variants };
 }
 
-async function resolveH264MediaPlaylist(url: string): Promise<{ url: string; diagnostic: string }> {
+async function resolveH264MediaPlaylist(url: string): Promise<{ probe: HlsProbe; diagnostic: string }> {
   let current = url;
   const trail: string[] = [];
 
@@ -79,7 +80,7 @@ async function resolveH264MediaPlaylist(url: string): Promise<{ url: string; dia
     trail.push(`${probe.kind} HTTP ${probe.status}${probe.contentType ? ` ${probe.contentType.split(";")[0]}` : ""}`);
 
     if (probe.kind !== "master") {
-      return { url: probe.url, diagnostic: trail.join(" → ") };
+      return { probe, diagnostic: trail.join(" → ") };
     }
 
     const explicitlyH264 = probe.variants.filter((v) => /(?:^|,)(?:avc1|avc3)\./i.test(v.codecs));
@@ -103,6 +104,39 @@ async function resolveH264MediaPlaylist(url: string): Promise<{ url: string; dia
   }
 
   throw new Error("HLS master playlist nesting is deeper than expected");
+}
+
+function localizeMediaPlaylist(probe: HlsProbe): { text: string; segmentCount: number } {
+  const lines = probe.text.split(/\r?\n/);
+  let segmentCount = 0;
+
+  const absolutize = (uri: string): string => {
+    const absolute = new URL(uri, probe.url).href;
+    return absolute.startsWith("jsfetch:") ? absolute : `jsfetch:${absolute}`;
+  };
+
+  const rewritten = lines.map((line) => {
+    const trimmed = line.trim();
+    if (!trimmed) return line;
+
+    if (/^#EXT-X-KEY:/i.test(trimmed)) {
+      const method = trimmed.match(/METHOD=([^,]*)/i)?.[1]?.toUpperCase();
+      if (method && method !== "NONE") {
+        throw new Error(`encrypted HLS is not enabled in the WASM beta (METHOD=${method})`);
+      }
+    }
+
+    // Tags such as EXT-X-MAP and EXT-X-KEY can carry a URI attribute.
+    if (trimmed.startsWith("#")) {
+      return line.replace(/URI="([^"]+)"/g, (_match, uri: string) => `URI="${absolutize(uri)}"`);
+    }
+
+    segmentCount++;
+    const leading = line.slice(0, line.indexOf(trimmed));
+    return leading + absolutize(trimmed);
+  });
+
+  return { text: rewritten.join("\n"), segmentCount };
 }
 
 class YuvRenderer {
@@ -364,19 +398,42 @@ export class WasmHlsPlayer {
     this.libav = libav;
 
     emitStatus({ message: "WASM beta: probing HLS playlist…" });
-    let mediaUrl = url;
     let hlsDiagnostic = "probe unavailable";
+    let localPlaylist = "";
     try {
       const resolved = await resolveH264MediaPlaylist(url);
-      mediaUrl = resolved.url;
       hlsDiagnostic = resolved.diagnostic;
-      emitStatus({ message: `WASM beta: ${hlsDiagnostic} · opening media playlist…` });
+      const localized = localizeMediaPlaylist(resolved.probe);
+      if (!localized.segmentCount) {
+        throw new Error("media playlist contains no segment URIs");
+      }
+      localPlaylist = localized.text;
+      emitStatus({
+        message: `WASM beta: ${hlsDiagnostic} · ${localized.segmentCount} segments · opening local playlist…`,
+      });
     } catch (err) {
       const msg = err instanceof Error ? err.message : String(err);
       throw new Error(`HLS probe failed: ${msg}`);
     }
 
-    const [formatContext, streams] = await libav.ff_init_demuxer_file(`jsfetch:${mediaUrl}`);
+    // libav.js's jsfetch protocol is reliable for the media objects, but feeding
+    // the .m3u8 itself through jsfetch can fail during avformat_open_input on
+    // some HLS layouts. Put the playlist in MEMFS and make every media URI an
+    // absolute jsfetch: URL instead.
+    const playlistName = `wasm-live-${generation}.m3u8`;
+    await libav.writeFile(playlistName, new TextEncoder().encode(localPlaylist));
+
+    let formatContext: any;
+    let streams: any[];
+    try {
+      [formatContext, streams] = await libav.ff_init_demuxer_file(
+        playlistName,
+        { format: "hls" },
+      );
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      throw new Error(`Could not open localized HLS playlist (${hlsDiagnostic}): ${msg}`);
+    }
     if (generation !== this.generation) return;
 
     // AVMEDIA_TYPE_VIDEO is 0 in FFmpeg. Some libav.js worker builds do not
