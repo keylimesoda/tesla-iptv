@@ -1,0 +1,158 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
+<title>libav.js H.264 → WebGL Test</title>
+<style>
+:root{color-scheme:dark;font-family:system-ui,-apple-system,Segoe UI,sans-serif}
+body{margin:0;background:#111;color:#eee}main{max-width:900px;margin:auto;padding:16px}
+h1{font-size:22px;margin:0 0 6px}p{color:#bbb;margin:6px 0 14px}
+canvas{width:100%;aspect-ratio:16/9;display:block;background:#000;border:1px solid #444}
+.grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(155px,1fr));gap:8px;margin:12px 0}
+.card{background:#1b1b1b;border:1px solid #333;border-radius:8px;padding:10px}
+.label{font-size:11px;color:#999;text-transform:uppercase;letter-spacing:.05em}
+.value{font:600 15px ui-monospace,SFMono-Regular,Consolas,monospace;margin-top:4px;word-break:break-word}
+button{padding:11px 16px;font-size:16px}#log{white-space:pre-wrap;font:12px ui-monospace,SFMono-Regular,Consolas,monospace;color:#aaa;margin-top:12px}
+.pass{color:#8f8}.fail{color:#f88}
+</style>
+</head>
+<body><main>
+<h1>libav.js H.264 → YUV420 → WebGL</h1>
+<p>Standalone decoder/render diagnostic. Decodes a bundled H.264/MP4 sample in WebAssembly and renders decoded YUV planes directly to WebGL. No &lt;video&gt;, MediaSource, WebCodecs, audio, or IPTV/network stream.</p>
+<canvas id="c" width="640" height="360"></canvas>
+<div class="grid">
+ <div class="card"><div class="label">Status</div><div id="status" class="value">ready</div></div>
+ <div class="card"><div class="label">Decoded frames</div><div id="frames" class="value">—</div></div>
+ <div class="card"><div class="label">Decode FPS</div><div id="decodefps" class="value">—</div></div>
+ <div class="card"><div class="label">Decode speed</div><div id="xrt" class="value">—</div></div>
+ <div class="card"><div class="label">Render FPS</div><div id="renderfps" class="value">—</div></div>
+ <div class="card"><div class="label">Frame format</div><div id="format" class="value">—</div></div>
+ <div class="card"><div class="label">Resolution</div><div id="resolution" class="value">—</div></div>
+ <div class="card"><div class="label">WebGL renderer</div><div id="renderer" class="value">—</div></div>
+</div>
+<button id="run">Run H.264 decode test</button>
+<div id="log"></div>
+<script>
+(() => {
+'use strict';
+const $=id=>document.getElementById(id);
+const log=s=>{$('log').textContent+=s+'\n';};
+const status=(s,ok)=>{$('status').textContent=s;$('status').className='value '+(ok===true?'pass':ok===false?'fail':'');};
+log('UA: '+navigator.userAgent);
+log('WebAssembly: '+(typeof WebAssembly==='object'));
+
+const canvas=$('c');
+const gl=canvas.getContext('webgl',{alpha:false,antialias:false,preserveDrawingBuffer:false});
+if(!gl){status('FAIL: WebGL unavailable',false);$('run').disabled=true;return;}
+const dbg=gl.getExtension('WEBGL_debug_renderer_info');
+$('renderer').textContent=dbg?gl.getParameter(dbg.UNMASKED_RENDERER_WEBGL):gl.getParameter(gl.RENDERER);
+
+const vs=`
+attribute vec2 aPos; varying vec2 vUV;
+void main(){vUV=(aPos+1.0)*0.5;vUV.y=1.0-vUV.y;gl_Position=vec4(aPos,0.0,1.0);}
+`;
+const fs=`
+precision mediump float; varying vec2 vUV;
+uniform sampler2D yTex; uniform sampler2D uTex; uniform sampler2D vTex;
+void main(){
+ float y=texture2D(yTex,vUV).r;
+ float u=texture2D(uTex,vUV).r-0.5;
+ float v=texture2D(vTex,vUV).r-0.5;
+ gl_FragColor=vec4(y+1.402*v,y-0.344136*u-0.714136*v,y+1.772*u,1.0);
+}
+`;
+function shader(t,s){const x=gl.createShader(t);gl.shaderSource(x,s);gl.compileShader(x);
+ if(!gl.getShaderParameter(x,gl.COMPILE_STATUS))throw Error(gl.getShaderInfoLog(x)||'shader compile');return x;}
+const prog=gl.createProgram();gl.attachShader(prog,shader(gl.VERTEX_SHADER,vs));gl.attachShader(prog,shader(gl.FRAGMENT_SHADER,fs));gl.linkProgram(prog);
+if(!gl.getProgramParameter(prog,gl.LINK_STATUS)){status('FAIL: shader link',false);return;}
+gl.useProgram(prog);
+const b=gl.createBuffer();gl.bindBuffer(gl.ARRAY_BUFFER,b);gl.bufferData(gl.ARRAY_BUFFER,new Float32Array([-1,-1,1,-1,-1,1,1,1]),gl.STATIC_DRAW);
+const ap=gl.getAttribLocation(prog,'aPos');gl.enableVertexAttribArray(ap);gl.vertexAttribPointer(ap,2,gl.FLOAT,false,0,0);
+function tex(unit,name){const t=gl.createTexture();gl.activeTexture(gl.TEXTURE0+unit);gl.bindTexture(gl.TEXTURE_2D,t);
+ gl.texParameteri(gl.TEXTURE_2D,gl.TEXTURE_MIN_FILTER,gl.LINEAR);gl.texParameteri(gl.TEXTURE_2D,gl.TEXTURE_MAG_FILTER,gl.LINEAR);
+ gl.texParameteri(gl.TEXTURE_2D,gl.TEXTURE_WRAP_S,gl.CLAMP_TO_EDGE);gl.texParameteri(gl.TEXTURE_2D,gl.TEXTURE_WRAP_T,gl.CLAMP_TO_EDGE);
+ gl.uniform1i(gl.getUniformLocation(prog,name),unit);return t;}
+const texs=[tex(0,'yTex'),tex(1,'uTex'),tex(2,'vTex')];
+gl.pixelStorei(gl.UNPACK_ALIGNMENT,1);
+let tw=0,th=0;
+function upload(unit,w,h,data){gl.activeTexture(gl.TEXTURE0+unit);gl.bindTexture(gl.TEXTURE_2D,texs[unit]);
+ if(tw!==w || th!==h || unit>0){gl.texImage2D(gl.TEXTURE_2D,0,gl.LUMINANCE,w,h,0,gl.LUMINANCE,gl.UNSIGNED_BYTE,data);}
+ else gl.texSubImage2D(gl.TEXTURE_2D,0,0,0,w,h,gl.LUMINANCE,gl.UNSIGNED_BYTE,data);}
+function plane(frame,i,w,h){
+ const l=frame.layout[i]; if(!l)throw Error('Missing plane '+i);
+ if(l.stride===w)return frame.data.subarray(l.offset,l.offset+w*h);
+ const out=new Uint8Array(w*h);
+ for(let y=0;y<h;y++)out.set(frame.data.subarray(l.offset+y*l.stride,l.offset+y*l.stride+w),y*w);
+ return out;
+}
+function renderFrame(f){
+ if(f.format!==0)throw Error('Expected AV_PIX_FMT_YUV420P (0), got '+f.format);
+ const w=f.width,h=f.height,uw=w>>1,uh=h>>1;
+ upload(0,w,h,plane(f,0,w,h)); upload(1,uw,uh,plane(f,1,uw,uh)); upload(2,uw,uh,plane(f,2,uw,uh));
+ tw=w;th=h; gl.viewport(0,0,canvas.width,canvas.height);gl.drawArrays(gl.TRIANGLE_STRIP,0,4);
+}
+function frameSeconds(f,index){
+ if(Number.isFinite(f.pts)&&f.time_base_num&&f.time_base_den)return f.pts*f.time_base_num/f.time_base_den;
+ return index/30;
+}
+function loadScript(src){return new Promise((resolve,reject)=>{const s=document.createElement('script');s.src=src;s.onload=resolve;s.onerror=()=>reject(Error('Failed to load '+src));document.head.appendChild(s);});}
+
+$('run').onclick=async()=>{
+ $('run').disabled=true;$('log').textContent='';status('loading libav.js…');$('frames').textContent='—';$('decodefps').textContent='—';$('xrt').textContent='—';$('renderfps').textContent='—';
+ try{
+  window.LibAV={base:'./libav-h264'};
+  await loadScript('./libav-h264/libav-6.10.9.0-h264-poc.js');
+  status('initializing WASM…');
+  const libav=await LibAV.LibAV({noworker:true});
+  status('fetching sample…');
+  const ab=await (await fetch('./libav-h264/sample-h264.mp4?'+Date.now(),{cache:'no-store'})).arrayBuffer();
+  await libav.writeFile('sample.mp4',new Uint8Array(ab));
+  const [fmt,streams]=await libav.ff_init_demuxer_file('sample.mp4');
+  let vi=-1;for(let i=0;i<streams.length;i++)if(streams[i].codec_type===libav.AVMEDIA_TYPE_VIDEO){vi=i;break;}
+  if(vi<0)throw Error('No video stream');
+  const st=streams[vi];
+  const [,ctx,pkt,frame]=await libav.ff_init_decoder(st.codec_id,st.codecpar);
+  status('decoding H.264 in WASM…');
+  const decoded=[];const d0=performance.now();
+  while(true){
+    const [res,packets]=await libav.ff_read_multi(fmt,pkt,null,{limit:1024*1024});
+    const vp=packets[vi]||[];
+    const fs=await libav.ff_decode_multi(ctx,pkt,frame,vp,{fin:res===libav.AVERROR_EOF,copyoutFrame:'video_packed'});
+    decoded.push(...fs);
+    $('frames').textContent=String(decoded.length);
+    if(res===libav.AVERROR_EOF)break;
+  }
+  const dsec=(performance.now()-d0)/1000;
+  if(!decoded.length)throw Error('Decoder produced zero frames');
+  const first=decoded[0],last=decoded[decoded.length-1];
+  const t0=frameSeconds(first,0),t1=frameSeconds(last,decoded.length-1);
+  const media=Math.max((t1-t0)+(1/30),decoded.length/30);
+  $('decodefps').textContent=(decoded.length/dsec).toFixed(1);
+  $('xrt').textContent=(media/dsec).toFixed(2)+'× real-time';
+  $('format').textContent='AV_PIX_FMT '+first.format+(first.format===0?' (YUV420P)':'');
+  $('resolution').textContent=first.width+'×'+first.height;
+  log('Decoded '+decoded.length+' frames in '+dsec.toFixed(3)+' s; media '+media.toFixed(3)+' s.');
+  log('First frame layout: '+JSON.stringify(first.layout));
+  status('rendering decoded frames…');
+  let i=0,drawn=0;const p0=performance.now();
+  const base=frameSeconds(decoded[0],0);
+  await new Promise((resolve,reject)=>{
+   function tick(now){
+    try{
+     const elapsed=(now-p0)/1000;
+     while(i<decoded.length && frameSeconds(decoded[i],i)-base<=elapsed+0.016){renderFrame(decoded[i]);i++;drawn++;}
+     if(i<decoded.length)requestAnimationFrame(tick);else resolve();
+    }catch(e){reject(e);}
+   } requestAnimationFrame(tick);
+  });
+  const psec=(performance.now()-p0)/1000;
+  $('renderfps').textContent=(drawn/psec).toFixed(1);
+  status('PASS: H.264 WASM → WebGL',true);
+  log('Rendered '+drawn+' decoded frames in '+psec.toFixed(3)+' s.');
+ }catch(e){console.error(e);status('FAIL: '+(e&&e.message?e.message:String(e)),false);log(String(e&&e.stack?e.stack:e));}
+ finally{$('run').disabled=false;}
+};
+})();
+</script>
+</main></body></html>
