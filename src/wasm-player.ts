@@ -143,20 +143,36 @@ function localizeMediaPlaylist(probe: HlsProbe): { text: string; segmentCount: n
 type MediaSegment = {
   url: string;
   duration: number;
+  sequence: number;
+  key: string;
 };
 
 function parseMediaSegments(probe: HlsProbe): {
   initUrl: string | null;
   segments: MediaSegment[];
   endList: boolean;
+  mediaSequence: number;
+  targetDuration: number;
 } {
   const lines = probe.text.split(/\r?\n/).map((line) => line.trim());
   let initUrl: string | null = null;
   let pendingDuration = 0;
+  let mediaSequence = 0;
+  let targetDuration = 0;
   const segments: MediaSegment[] = [];
 
   for (const line of lines) {
     if (!line) continue;
+
+    if (/^#EXT-X-MEDIA-SEQUENCE:/i.test(line)) {
+      mediaSequence = Number(line.slice("#EXT-X-MEDIA-SEQUENCE:".length)) || 0;
+      continue;
+    }
+
+    if (/^#EXT-X-TARGETDURATION:/i.test(line)) {
+      targetDuration = Number(line.slice("#EXT-X-TARGETDURATION:".length)) || 0;
+      continue;
+    }
 
     if (/^#EXT-X-KEY:/i.test(line)) {
       const method = line.match(/METHOD=([^,]*)/i)?.[1]?.toUpperCase();
@@ -183,9 +199,13 @@ function parseMediaSegments(probe: HlsProbe): {
 
     if (line.startsWith("#")) continue;
 
+    const sequence = mediaSequence + segments.length;
+    const segmentUrl = new URL(line, probe.url).href;
     segments.push({
-      url: new URL(line, probe.url).href,
+      url: segmentUrl,
       duration: pendingDuration,
+      sequence,
+      key: `${sequence}|${segmentUrl}`,
     });
     pendingDuration = 0;
   }
@@ -194,6 +214,8 @@ function parseMediaSegments(probe: HlsProbe): {
     initUrl,
     segments,
     endList: lines.some((line) => /^#EXT-X-ENDLIST/i.test(line)),
+    mediaSequence,
+    targetDuration,
   };
 }
 
@@ -248,13 +270,16 @@ async function buildMediaSnapshot(probe: HlsProbe): Promise<{
   segmentCount: number;
   seconds: number;
   diagnostic: string;
+  seenKeys: string[];
+  initUrl: string | null;
+  targetDuration: number;
 }> {
   const parsed = parseMediaSegments(probe);
   if (!parsed.segments.length) throw new Error("media playlist contains no segment URIs");
 
-  // Three segments is enough to prove the transport/demux/decode path without
-  // pulling an entire VOD playlist into Tesla memory.
-  const selected = parsed.segments.slice(0, Math.min(3, parsed.segments.length));
+  // Start close to the live edge. Three segments gives the demuxer enough
+  // startup data while keeping latency and memory bounded.
+  const selected = parsed.segments.slice(Math.max(0, parsed.segments.length - 3));
   const parts: Uint8Array[] = [];
   let initBytes: Uint8Array | null = null;
 
@@ -278,13 +303,19 @@ async function buildMediaSnapshot(probe: HlsProbe): Promise<{
   if (!firstMedia) throw new Error("no media bytes fetched");
   const container = sniffContainer(initBytes || firstMedia, selected[0].url, !!initBytes);
   const seconds = selected.reduce((sum, seg) => sum + seg.duration, 0);
+  const bytes = parts.reduce((n, p) => n + p.byteLength, 0);
 
   return {
     data: concatBytes(parts),
     container,
     segmentCount: selected.length,
     seconds,
-    diagnostic: `${container} · ${selected.length} segment${selected.length === 1 ? "" : "s"} · ${(parts.reduce((n, p) => n + p.byteLength, 0) / 1024 / 1024).toFixed(1)} MiB${firstContentType ? ` · ${firstContentType.split(";")[0]}` : ""}`,
+    diagnostic: `${container} · ${selected.length} segment${selected.length === 1 ? "" : "s"} · ${(bytes / 1024 / 1024).toFixed(1)} MiB${firstContentType ? ` · ${firstContentType.split(";")[0]}` : ""}`,
+    // Mark the entire current sliding window seen. We only preload the last
+    // three, and must not later append older segments behind them.
+    seenKeys: parsed.segments.map((seg) => seg.key),
+    initUrl: parsed.initUrl,
+    targetDuration: parsed.targetDuration,
   };
 }
 
@@ -571,20 +602,89 @@ export class WasmHlsPlayer {
     }
     if (generation !== this.generation) return;
 
-    const mediaName = `wasm-media-${generation}.${snapshot.container === "mpegts" ? "ts" : "mp4"}`;
-    await libav.writeFile(mediaName, snapshot.data);
+    const readerName = `wasm-live-${generation}.${snapshot.container === "mpegts" ? "ts" : "mp4"}`;
+    await libav.mkreaderdev(readerName);
+    await libav.ff_reader_dev_send(readerName, snapshot.data);
+
+    const seen = new Set<string>(snapshot.seenKeys);
+    let currentInitUrl = snapshot.initUrl;
+    let feedPromise: Promise<void> | null = null;
+    let deliveredSegments = snapshot.segmentCount;
+
+    const feedMore = (): Promise<void> => {
+      if (feedPromise) return feedPromise;
+
+      feedPromise = (async () => {
+        while (generation === this.generation) {
+          const latestProbe = await probePlaylist(mediaProbe.url);
+          const parsed = parseMediaSegments(latestProbe);
+
+          // If an fMP4 stream changes initialization data, inject the new init
+          // fragment before the first media fragment that depends on it.
+          if (parsed.initUrl && parsed.initUrl !== currentInitUrl) {
+            const init = await fetchBytes(parsed.initUrl, "HLS init segment");
+            await libav.ff_reader_dev_send(readerName, init.data);
+            currentInitUrl = parsed.initUrl;
+            emitStatus({ message: "WASM beta: HLS init segment updated" });
+            return;
+          }
+
+          const pending = parsed.segments.filter((seg) => !seen.has(seg.key));
+          if (pending.length) {
+            // Preserve playlist order. Sending the currently available batch is
+            // fine: the libav reader device buffers bytes until FFmpeg asks.
+            for (const seg of pending) {
+              const fetched = await fetchBytes(seg.url, `HLS segment ${seg.sequence}`);
+              if (generation !== this.generation) return;
+              await libav.ff_reader_dev_send(readerName, fetched.data);
+              seen.add(seg.key);
+              deliveredSegments++;
+            }
+            emitStatus({
+              message: `WASM beta: live HLS · ${deliveredSegments} segments delivered · decoding…`,
+            });
+            return;
+          }
+
+          if (parsed.endList) {
+            await libav.ff_reader_dev_send(readerName, null);
+            return;
+          }
+
+          const target = parsed.targetDuration || snapshot.targetDuration || 2;
+          await sleep(Math.max(500, Math.min(3000, target * 500)));
+        }
+
+        // Unblock a pending read if the player was stopped.
+        try {
+          await libav.ff_reader_dev_send(readerName, null);
+        } catch {
+          // libav may already have been terminated.
+        }
+      })().finally(() => {
+        feedPromise = null;
+      });
+
+      return feedPromise;
+    };
+
+    libav.onread = (name: string) => {
+      if (name !== readerName) return;
+      return feedMore();
+    };
+
     emitStatus({
-      message: `WASM beta: ${hlsDiagnostic} · ${snapshot.diagnostic} · opening media…`,
+      message: `WASM beta: ${hlsDiagnostic} · ${snapshot.diagnostic} · opening live media stream…`,
     });
 
     let formatContext: any;
     let streams: any[];
     try {
-      [formatContext, streams] = await libav.ff_init_demuxer_file(mediaName);
+      [formatContext, streams] = await libav.ff_init_demuxer_file(readerName);
     } catch (err) {
       const msg = err instanceof Error ? err.message : String(err);
       throw new Error(
-        `Could not open fetched ${snapshot.container} media (${snapshot.diagnostic}): ${msg}`,
+        `Could not open live ${snapshot.container} stream (${snapshot.diagnostic}): ${msg}`,
       );
     }
     if (generation !== this.generation) return;
@@ -625,7 +725,7 @@ export class WasmHlsPlayer {
     let baseWall = performance.now();
 
     emitStatus({
-      message: `WASM beta: decoding H.264 · JS HLS bridge · ${snapshot.segmentCount} segments${snapshot.seconds ? ` / ~${snapshot.seconds.toFixed(1)}s` : ""}`,
+      message: `WASM beta: decoding H.264 · live JS HLS bridge · ${snapshot.segmentCount}-segment startup buffer${snapshot.seconds ? ` / ~${snapshot.seconds.toFixed(1)}s` : ""}`,
       width: stream.codecpar?.width,
       height: stream.codecpar?.height,
     });
@@ -686,7 +786,7 @@ export class WasmHlsPlayer {
         if (this.decodeFrames === 1 || this.decodeFrames % 30 === 0) {
           const elapsed = Math.max(0.001, (performance.now() - this.decodeStarted) / 1000);
           emitStatus({
-            message: `WASM beta · ${decoded.width}×${decoded.height} · ${(this.decodeFrames / elapsed).toFixed(1)} decoded fps · JS HLS bridge · video only`,
+            message: `WASM beta · ${decoded.width}×${decoded.height} · ${(this.decodeFrames / elapsed).toFixed(1)} decoded fps · live HLS · video only`,
             frames: this.decodeFrames,
             width: decoded.width,
             height: decoded.height,
@@ -696,7 +796,7 @@ export class WasmHlsPlayer {
       }
 
       if (result === libav.AVERROR_EOF) {
-        emitStatus({ message: "WASM beta: stream ended" });
+        emitStatus({ message: "WASM beta: stream ended (HLS source reached EOF)" });
         break;
       }
     }
