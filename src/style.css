@@ -200,7 +200,8 @@ html, body {
   height: 360px;
 }
 
-#canvas {
+#canvas,
+#wasm-canvas {
   position: absolute;
   inset: 0;
   width: 100%;
@@ -208,7 +209,11 @@ html, body {
   display: none;
   background: #000;
 }
-#canvas.active { display: block; }
+#canvas.active,
+#wasm-canvas.active { display: block; }
+
+#stage.wasm-active #video,
+#stage.wasm-active #canvas { display: none; }
 
 #big-play {
   position: absolute;
@@ -248,7 +253,8 @@ html, body {
 
 #ctl-right { display: flex; align-items: center; gap: 10px; }
 
-#canvas-toggle {
+#canvas-toggle,
+#wasm-toggle {
   display: flex;
   align-items: center;
   gap: 8px;
@@ -261,8 +267,12 @@ html, body {
   cursor: pointer;
   user-select: none;
 }
-#canvas-toggle input { width: 20px; height: 20px; accent-color: var(--accent); }
-#canvas-toggle:has(input:checked) { border-color: var(--accent); background: var(--accent-soft); }
+#canvas-toggle input,
+#wasm-toggle input { width: 20px; height: 20px; accent-color: var(--accent); }
+#canvas-toggle:has(input:checked),
+#wasm-toggle:has(input:checked) { border-color: var(--accent); background: var(--accent-soft); }
+#wasm-toggle[hidden] { display: none; }
+#canvas-toggle:has(input:disabled) { opacity: 0.45; }
 
 /* ---------- settings sheet ---------- */
 #sheet {
