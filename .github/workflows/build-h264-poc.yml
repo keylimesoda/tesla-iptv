@@ -59,7 +59,7 @@ jobs:
         working-directory: libavjs
         run: |
           cd configs
-          ./mkconfig.js h264-poc '["avformat","avcodec","protocol-jsfetch","demuxer-hls","demuxer-mp4","parser-h264","decoder-h264"]'
+          ./mkconfig.js h264-poc '["avformat","avcodec","protocol-jsfetch","demuxer-hls","demuxer-mpegts","demuxer-mp4","parser-h264","decoder-h264"]'
 
       - name: Build H.264 WebAssembly target
         working-directory: libavjs
