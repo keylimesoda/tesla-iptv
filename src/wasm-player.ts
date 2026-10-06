@@ -139,6 +139,155 @@ function localizeMediaPlaylist(probe: HlsProbe): { text: string; segmentCount: n
   return { text: rewritten.join("\n"), segmentCount };
 }
 
+
+type MediaSegment = {
+  url: string;
+  duration: number;
+};
+
+function parseMediaSegments(probe: HlsProbe): {
+  initUrl: string | null;
+  segments: MediaSegment[];
+  endList: boolean;
+} {
+  const lines = probe.text.split(/\r?\n/).map((line) => line.trim());
+  let initUrl: string | null = null;
+  let pendingDuration = 0;
+  const segments: MediaSegment[] = [];
+
+  for (const line of lines) {
+    if (!line) continue;
+
+    if (/^#EXT-X-KEY:/i.test(line)) {
+      const method = line.match(/METHOD=([^,]*)/i)?.[1]?.toUpperCase();
+      if (method && method !== "NONE") {
+        throw new Error(`encrypted HLS is not enabled in the WASM beta (METHOD=${method})`);
+      }
+      continue;
+    }
+
+    if (/^#EXT-X-BYTERANGE:/i.test(line)) {
+      throw new Error("HLS byte-range segments are not enabled in the WASM beta");
+    }
+
+    if (/^#EXT-X-MAP:/i.test(line)) {
+      const uri = line.match(/URI="([^"]+)"/i)?.[1];
+      if (uri) initUrl = new URL(uri, probe.url).href;
+      continue;
+    }
+
+    if (/^#EXTINF:/i.test(line)) {
+      pendingDuration = Number(line.slice("#EXTINF:".length).split(",")[0]) || 0;
+      continue;
+    }
+
+    if (line.startsWith("#")) continue;
+
+    segments.push({
+      url: new URL(line, probe.url).href,
+      duration: pendingDuration,
+    });
+    pendingDuration = 0;
+  }
+
+  return {
+    initUrl,
+    segments,
+    endList: lines.some((line) => /^#EXT-X-ENDLIST/i.test(line)),
+  };
+}
+
+function concatBytes(parts: Uint8Array[]): Uint8Array {
+  const total = parts.reduce((sum, part) => sum + part.byteLength, 0);
+  const out = new Uint8Array(total);
+  let offset = 0;
+  for (const part of parts) {
+    out.set(part, offset);
+    offset += part.byteLength;
+  }
+  return out;
+}
+
+function sniffContainer(data: Uint8Array, firstUrl: string, hasInit: boolean): "mpegts" | "mp4" {
+  if (hasInit) return "mp4";
+
+  if (data.length >= 376 && data[0] === 0x47 && data[188] === 0x47) {
+    return "mpegts";
+  }
+
+  if (data.length >= 8) {
+    const box = String.fromCharCode(data[4], data[5], data[6], data[7]);
+    if (box === "ftyp" || box === "styp" || box === "moof") return "mp4";
+  }
+
+  const pathname = new URL(firstUrl).pathname.toLowerCase();
+  if (pathname.endsWith(".ts") || pathname.endsWith(".mpegts")) return "mpegts";
+  if (pathname.endsWith(".m4s") || pathname.endsWith(".mp4") || pathname.endsWith(".cmfv")) return "mp4";
+
+  throw new Error(
+    `could not identify media container (first bytes ${Array.from(data.slice(0, 8)).map((b) => b.toString(16).padStart(2, "0")).join(" ")})`,
+  );
+}
+
+async function fetchBytes(url: string, label: string): Promise<{ data: Uint8Array; contentType: string }> {
+  const response = await fetch(url, { cache: "no-store" });
+  if (!response.ok) {
+    throw new Error(`${label} HTTP ${response.status}`);
+  }
+  const data = new Uint8Array(await response.arrayBuffer());
+  if (!data.byteLength) throw new Error(`${label} returned zero bytes`);
+  return {
+    data,
+    contentType: response.headers.get("content-type") || "",
+  };
+}
+
+async function buildMediaSnapshot(probe: HlsProbe): Promise<{
+  data: Uint8Array;
+  container: "mpegts" | "mp4";
+  segmentCount: number;
+  seconds: number;
+  diagnostic: string;
+}> {
+  const parsed = parseMediaSegments(probe);
+  if (!parsed.segments.length) throw new Error("media playlist contains no segment URIs");
+
+  // Three segments is enough to prove the transport/demux/decode path without
+  // pulling an entire VOD playlist into Tesla memory.
+  const selected = parsed.segments.slice(0, Math.min(3, parsed.segments.length));
+  const parts: Uint8Array[] = [];
+  let initBytes: Uint8Array | null = null;
+
+  if (parsed.initUrl) {
+    const init = await fetchBytes(parsed.initUrl, "HLS init segment");
+    initBytes = init.data;
+    parts.push(init.data);
+  }
+
+  let firstMedia: Uint8Array | null = null;
+  let firstContentType = "";
+  for (let i = 0; i < selected.length; i++) {
+    const fetched = await fetchBytes(selected[i].url, `HLS segment ${i + 1}`);
+    if (!firstMedia) {
+      firstMedia = fetched.data;
+      firstContentType = fetched.contentType;
+    }
+    parts.push(fetched.data);
+  }
+
+  if (!firstMedia) throw new Error("no media bytes fetched");
+  const container = sniffContainer(initBytes || firstMedia, selected[0].url, !!initBytes);
+  const seconds = selected.reduce((sum, seg) => sum + seg.duration, 0);
+
+  return {
+    data: concatBytes(parts),
+    container,
+    segmentCount: selected.length,
+    seconds,
+    diagnostic: `${container} · ${selected.length} segment${selected.length === 1 ? "" : "s"} · ${(parts.reduce((n, p) => n + p.byteLength, 0) / 1024 / 1024).toFixed(1)} MiB${firstContentType ? ` · ${firstContentType.split(";")[0]}` : ""}`,
+  };
+}
+
 class YuvRenderer {
   private gl: WebGLRenderingContext;
   private program: WebGLProgram;
@@ -399,40 +548,44 @@ export class WasmHlsPlayer {
 
     emitStatus({ message: "WASM beta: probing HLS playlist…" });
     let hlsDiagnostic = "probe unavailable";
-    let localPlaylist = "";
+    let mediaProbe: HlsProbe;
     try {
       const resolved = await resolveH264MediaPlaylist(url);
       hlsDiagnostic = resolved.diagnostic;
-      const localized = localizeMediaPlaylist(resolved.probe);
-      if (!localized.segmentCount) {
-        throw new Error("media playlist contains no segment URIs");
-      }
-      localPlaylist = localized.text;
-      emitStatus({
-        message: `WASM beta: ${hlsDiagnostic} · ${localized.segmentCount} segments · opening local playlist…`,
-      });
+      mediaProbe = resolved.probe;
+      emitStatus({ message: `WASM beta: ${hlsDiagnostic} · fetching media segments…` });
     } catch (err) {
       const msg = err instanceof Error ? err.message : String(err);
       throw new Error(`HLS probe failed: ${msg}`);
     }
 
-    // libav.js's jsfetch protocol is reliable for the media objects, but feeding
-    // the .m3u8 itself through jsfetch can fail during avformat_open_input on
-    // some HLS layouts. Put the playlist in MEMFS and make every media URI an
-    // absolute jsfetch: URL instead.
-    const playlistName = `wasm-live-${generation}.m3u8`;
-    await libav.writeFile(playlistName, new TextEncoder().encode(localPlaylist));
+    // Keep HLS transport in JavaScript and give libav a plain media file.
+    // This deliberately avoids libav/FFmpeg's HLS demuxer, which is the part
+    // failing on the real IPTV playlists even though browser fetch succeeds.
+    let snapshot: Awaited<ReturnType<typeof buildMediaSnapshot>>;
+    try {
+      snapshot = await buildMediaSnapshot(mediaProbe);
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      throw new Error(`HLS media fetch failed (${hlsDiagnostic}): ${msg}`);
+    }
+    if (generation !== this.generation) return;
+
+    const mediaName = `wasm-media-${generation}.${snapshot.container === "mpegts" ? "ts" : "mp4"}`;
+    await libav.writeFile(mediaName, snapshot.data);
+    emitStatus({
+      message: `WASM beta: ${hlsDiagnostic} · ${snapshot.diagnostic} · opening media…`,
+    });
 
     let formatContext: any;
     let streams: any[];
     try {
-      [formatContext, streams] = await libav.ff_init_demuxer_file(
-        playlistName,
-        { format: "hls" },
-      );
+      [formatContext, streams] = await libav.ff_init_demuxer_file(mediaName);
     } catch (err) {
       const msg = err instanceof Error ? err.message : String(err);
-      throw new Error(`Could not open localized HLS playlist (${hlsDiagnostic}): ${msg}`);
+      throw new Error(
+        `Could not open fetched ${snapshot.container} media (${snapshot.diagnostic}): ${msg}`,
+      );
     }
     if (generation !== this.generation) return;
 
@@ -471,7 +624,11 @@ export class WasmHlsPlayer {
     let basePts: number | null = null;
     let baseWall = performance.now();
 
-    emitStatus({ message: "WASM beta: decoding H.264…", width: stream.codecpar?.width, height: stream.codecpar?.height });
+    emitStatus({
+      message: `WASM beta: decoding H.264 · JS HLS bridge · ${snapshot.segmentCount} segments${snapshot.seconds ? ` / ~${snapshot.seconds.toFixed(1)}s` : ""}`,
+      width: stream.codecpar?.width,
+      height: stream.codecpar?.height,
+    });
 
     while (generation === this.generation) {
       while (this.isPaused && generation === this.generation) await sleep(50);
@@ -529,7 +686,7 @@ export class WasmHlsPlayer {
         if (this.decodeFrames === 1 || this.decodeFrames % 30 === 0) {
           const elapsed = Math.max(0.001, (performance.now() - this.decodeStarted) / 1000);
           emitStatus({
-            message: `WASM beta · ${decoded.width}×${decoded.height} · ${(this.decodeFrames / elapsed).toFixed(1)} decoded fps · video only`,
+            message: `WASM beta · ${decoded.width}×${decoded.height} · ${(this.decodeFrames / elapsed).toFixed(1)} decoded fps · JS HLS bridge · video only`,
             frames: this.decodeFrames,
             width: decoded.width,
             height: decoded.height,
