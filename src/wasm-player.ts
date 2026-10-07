@@ -407,11 +407,13 @@ class NativeAacAudio {
 
     try {
       // Construct synchronously while the channel click is still a user gesture.
-      this.context = new ContextCtor({ latencyHint: "interactive" });
-      this.gain = this.context.createGain();
-      this.gain.gain.value = muted ? 0 : 1;
-      this.gain.connect(this.context.destination);
-      void this.context.resume().catch(() => {});
+      const context = new ContextCtor({ latencyHint: "interactive" }) as AudioContext;
+      const gain = context.createGain();
+      gain.gain.value = muted ? 0 : 1;
+      gain.connect(context.destination);
+      this.context = context;
+      this.gain = gain;
+      void context.resume().catch(() => {});
       this._status = "native AAC probing";
     } catch (error) {
       this._status = `Web Audio failed: ${error instanceof Error ? error.message : String(error)}`;
