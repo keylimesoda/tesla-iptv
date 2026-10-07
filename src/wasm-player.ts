@@ -309,6 +309,369 @@ function frameTimestamp(libav: any, frame: any): number | null {
     ?? timestamp64(libav, frame, "pts", "ptshi");
 }
 
+
+const AAC_SAMPLE_RATES = [
+  96000, 88200, 64000, 48000, 44100, 32000, 24000,
+  22050, 16000, 12000, 11025, 8000, 7350,
+];
+
+type AdtsFrame = {
+  data: Uint8Array;
+  sampleRate: number;
+  channels: number;
+  audioObjectType: number;
+};
+
+function splitAdtsFrames(data: Uint8Array): AdtsFrame[] {
+  const out: AdtsFrame[] = [];
+  let offset = 0;
+
+  while (offset + 7 <= data.length) {
+    // Be tolerant of a few non-AAC bytes at PES boundaries.
+    if (data[offset] !== 0xff || (data[offset + 1] & 0xf6) !== 0xf0) {
+      offset++;
+      continue;
+    }
+
+    const frequencyIndex = (data[offset + 2] >> 2) & 0x0f;
+    const sampleRate = AAC_SAMPLE_RATES[frequencyIndex] || 0;
+    const channels = ((data[offset + 2] & 0x01) << 2) | ((data[offset + 3] >> 6) & 0x03);
+    const audioObjectType = ((data[offset + 2] >> 6) & 0x03) + 1;
+    const frameLength =
+      ((data[offset + 3] & 0x03) << 11) |
+      (data[offset + 4] << 3) |
+      ((data[offset + 5] >> 5) & 0x07);
+
+    if (!sampleRate || !channels || frameLength < 7 || offset + frameLength > data.length) break;
+
+    out.push({
+      data: data.slice(offset, offset + frameLength),
+      sampleRate,
+      channels,
+      audioObjectType,
+    });
+    offset += frameLength;
+  }
+
+  return out;
+}
+
+function packetTimestampUs(libav: any, packet: any, stream: any): number | null {
+  const pts = timestamp64(libav, packet, "pts", "ptshi")
+    ?? timestamp64(libav, packet, "dts", "dtshi");
+  const tbNum = packet.time_base_num || stream.time_base_num;
+  const tbDen = packet.time_base_den || stream.time_base_den;
+  if (pts === null || !tbNum || !tbDen) return null;
+  return Math.round(pts * tbNum / tbDen * 1_000_000);
+}
+
+function aacCodecForObjectType(audioObjectType: number): string {
+  if (audioObjectType === 5) return "mp4a.40.5";
+  if (audioObjectType === 29) return "mp4a.40.29";
+  return `mp4a.40.${audioObjectType || 2}`;
+}
+
+class NativeAacAudio {
+  private context: AudioContext | null = null;
+  private gain: GainNode | null = null;
+  private decoder: any = null;
+  private decoderCtor: any = null;
+  private encodedChunkCtor: any = null;
+  private codecpar: any = null;
+  private container: "mpegts" | "mp4" = "mpegts";
+  private configured = false;
+  private nextInputTimestampUs: number | null = null;
+
+  private baseMediaSeconds: number | null = null;
+  private baseContextTime = 0;
+  private scheduledUntil = 0;
+  private _status = "audio probe";
+  private _muted = false;
+
+  constructor(muted: boolean) {
+    this._muted = muted;
+
+    const globalAny = globalThis as any;
+    const ContextCtor = globalAny.AudioContext || globalAny.webkitAudioContext;
+    this.decoderCtor = globalAny.AudioDecoder;
+    this.encodedChunkCtor = globalAny.EncodedAudioChunk;
+
+    if (!ContextCtor) {
+      this._status = "Web Audio unavailable";
+      return;
+    }
+    if (!this.decoderCtor || !this.encodedChunkCtor) {
+      this._status = "native AudioDecoder unavailable";
+      return;
+    }
+
+    try {
+      // Construct synchronously while the channel click is still a user gesture.
+      this.context = new ContextCtor({ latencyHint: "interactive" });
+      this.gain = this.context.createGain();
+      this.gain.gain.value = muted ? 0 : 1;
+      this.gain.connect(this.context.destination);
+      void this.context.resume().catch(() => {});
+      this._status = "native AAC probing";
+    } catch (error) {
+      this._status = `Web Audio failed: ${error instanceof Error ? error.message : String(error)}`;
+    }
+  }
+
+  get status(): string {
+    return this._status;
+  }
+
+  get muted(): boolean {
+    return this._muted;
+  }
+
+  setMuted(muted: boolean): void {
+    this._muted = muted;
+    if (this.gain && this.context) {
+      this.gain.gain.setValueAtTime(muted ? 0 : 1, this.context.currentTime);
+    }
+  }
+
+  resume(): void {
+    if (this.context) void this.context.resume().catch(() => {});
+  }
+
+  suspend(): void {
+    if (this.context) void this.context.suspend().catch(() => {});
+  }
+
+  disable(reason: string): void {
+    this._status = reason;
+    this.configured = false;
+    if (this.decoder) {
+      try {
+        this.decoder.close();
+      } catch {
+        // Best effort.
+      }
+      this.decoder = null;
+    }
+  }
+
+  async prepare(codecName: string, codecpar: any, container: "mpegts" | "mp4"): Promise<void> {
+    this.codecpar = codecpar;
+    this.container = container;
+
+    if (!this.context || !this.decoderCtor || !this.encodedChunkCtor) return;
+    if (codecName !== "aac") {
+      this.disable(`native audio unsupported (${codecName || "unknown codec"})`);
+      return;
+    }
+
+    // MPEG-TS normally carries ADTS. We configure lazily from the first ADTS
+    // frame so the decoder sees exactly the profile/rate/channel metadata that
+    // accompanies the bytes. fMP4 carries raw AAC and needs AudioSpecificConfig.
+    if (container === "mp4") {
+      const description = codecpar?.extradata;
+      if (!description?.byteLength) {
+        this.disable("AAC config missing");
+        return;
+      }
+
+      const objectType = ((description[0] >> 3) & 0x1f) || 2;
+      await this.configure({
+        codec: aacCodecForObjectType(objectType),
+        sampleRate: codecpar.sample_rate || 48000,
+        numberOfChannels: codecpar.channels || 2,
+        description,
+      });
+    } else {
+      this._status = "native AAC · waiting for ADTS";
+    }
+  }
+
+  private async configure(config: Record<string, unknown>): Promise<boolean> {
+    if (this.configured) return true;
+    if (!this.context || !this.decoderCtor) return false;
+
+    try {
+      if (typeof this.decoderCtor.isConfigSupported === "function") {
+        const support = await this.decoderCtor.isConfigSupported(config);
+        if (!support?.supported) {
+          this.disable(`native AAC unsupported (${String(config.codec)})`);
+          return false;
+        }
+      }
+
+      this.decoder = new this.decoderCtor({
+        output: (audioData: any) => this.handleOutput(audioData),
+        error: (error: unknown) => {
+          this._status = `native audio error: ${error instanceof Error ? error.message : String(error)}`;
+        },
+      });
+      this.decoder.configure(config);
+      this.configured = true;
+      this._status = `native AAC ${String(config.codec)}`;
+      return true;
+    } catch (error) {
+      this.disable(`native AAC setup failed: ${error instanceof Error ? error.message : String(error)}`);
+      return false;
+    }
+  }
+
+  async pushPackets(packets: any[], stream: any, libav: any): Promise<void> {
+    if (!this.context || !this.decoderCtor || !this.encodedChunkCtor || !this.codecpar) return;
+    if (!packets.length) return;
+
+    for (const packet of packets) {
+      if (!packet?.data?.byteLength) continue;
+
+      if (this.container === "mpegts") {
+        const adts = splitAdtsFrames(packet.data);
+        if (!adts.length) {
+          if (!this.configured) this._status = "native AAC · no ADTS frames";
+          continue;
+        }
+
+        const first = adts[0];
+        if (!this.configured) {
+          const ok = await this.configure({
+            codec: aacCodecForObjectType(first.audioObjectType),
+            sampleRate: first.sampleRate,
+            numberOfChannels: first.channels,
+            // No description: WebCodecs interprets the chunk as ADTS.
+          });
+          if (!ok) return;
+        }
+
+        const packetTs = packetTimestampUs(libav, packet, stream);
+        if (packetTs !== null) {
+          if (
+            this.nextInputTimestampUs === null ||
+            Math.abs(packetTs - this.nextInputTimestampUs) > 500_000
+          ) {
+            this.nextInputTimestampUs = packetTs;
+          }
+        }
+        if (this.nextInputTimestampUs === null) this.nextInputTimestampUs = 0;
+
+        for (const frame of adts) {
+          const timestamp = Math.round(this.nextInputTimestampUs);
+          const duration = 1024 / frame.sampleRate * 1_000_000;
+          const chunk = new this.encodedChunkCtor({
+            type: "key",
+            timestamp,
+            duration: Math.round(duration),
+            data: frame.data,
+          });
+          this.decoder.decode(chunk);
+          this.nextInputTimestampUs += duration;
+        }
+      } else {
+        if (!this.configured || !this.decoder) continue;
+        const timestamp = packetTimestampUs(libav, packet, stream);
+        if (timestamp === null) continue;
+
+        const chunkInit: Record<string, unknown> = {
+          type: "key",
+          timestamp,
+          data: packet.data,
+        };
+
+        const duration = timestamp64(libav, packet, "duration", "durationhi");
+        const tbNum = packet.time_base_num || stream.time_base_num;
+        const tbDen = packet.time_base_den || stream.time_base_den;
+        if (duration !== null && tbNum && tbDen) {
+          chunkInit.duration = Math.round(duration * tbNum / tbDen * 1_000_000);
+        }
+
+        this.decoder.decode(new this.encodedChunkCtor(chunkInit));
+      }
+    }
+  }
+
+  private handleOutput(audioData: any): void {
+    const context = this.context;
+    const gain = this.gain;
+    if (!context || !gain) {
+      audioData.close?.();
+      return;
+    }
+
+    try {
+      const channels = audioData.numberOfChannels;
+      const frames = audioData.numberOfFrames;
+      const sampleRate = audioData.sampleRate;
+      const buffer = context.createBuffer(channels, frames, sampleRate);
+
+      for (let channel = 0; channel < channels; channel++) {
+        audioData.copyTo(buffer.getChannelData(channel), {
+          planeIndex: channel,
+          format: "f32-planar",
+        });
+      }
+
+      const mediaSeconds = audioData.timestamp / 1_000_000;
+      const lead = 0.12;
+
+      if (this.baseMediaSeconds === null) {
+        this.baseMediaSeconds = mediaSeconds;
+        this.baseContextTime = context.currentTime + lead;
+      }
+
+      let startAt = this.baseContextTime + (mediaSeconds - this.baseMediaSeconds);
+
+      // Recover from a discontinuity or an underrun by establishing a fresh
+      // audio/media clock mapping instead of trying to play old samples late.
+      if (startAt < context.currentTime - 0.10 || startAt > context.currentTime + 8) {
+        this.baseMediaSeconds = mediaSeconds;
+        this.baseContextTime = context.currentTime + lead;
+        startAt = this.baseContextTime;
+      }
+
+      const source = context.createBufferSource();
+      source.buffer = buffer;
+      source.connect(gain);
+      source.start(Math.max(startAt, context.currentTime + 0.005));
+      this.scheduledUntil = Math.max(this.scheduledUntil, startAt + buffer.duration);
+    } catch (error) {
+      this._status = `native audio output failed: ${error instanceof Error ? error.message : String(error)}`;
+    } finally {
+      audioData.close?.();
+    }
+  }
+
+  targetWallMs(mediaSeconds: number): number | null {
+    const context = this.context;
+    if (
+      !context ||
+      this.baseMediaSeconds === null ||
+      context.state !== "running" ||
+      !Number.isFinite(mediaSeconds)
+    ) {
+      return null;
+    }
+
+    const targetContextTime = this.baseContextTime + (mediaSeconds - this.baseMediaSeconds);
+    return performance.now() + (targetContextTime - context.currentTime) * 1000;
+  }
+
+  stop(): void {
+    if (this.decoder) {
+      try {
+        this.decoder.close();
+      } catch {
+        // Best effort.
+      }
+      this.decoder = null;
+    }
+    if (this.context) {
+      void this.context.close().catch(() => {});
+      this.context = null;
+    }
+    this.gain = null;
+    this.baseMediaSeconds = null;
+    this.nextInputTimestampUs = null;
+    this.configured = false;
+  }
+}
+
 class YuvRenderer {
   private gl: WebGLRenderingContext;
   private program: WebGLProgram;
@@ -489,6 +852,8 @@ export class WasmHlsPlayer {
   private libav: any = null;
   private generation = 0;
   private isPaused = false;
+  private isMuted = false;
+  private audio: NativeAacAudio | null = null;
 
   constructor(private canvas: HTMLCanvasElement) {}
 
@@ -498,19 +863,33 @@ export class WasmHlsPlayer {
 
   play(): void {
     this.isPaused = false;
+    this.audio?.resume();
   }
 
   pause(): void {
     this.isPaused = true;
+    this.audio?.suspend();
   }
 
   toggle(): void {
-    this.isPaused = !this.isPaused;
+    if (this.isPaused) this.play();
+    else this.pause();
+  }
+
+  setMuted(muted: boolean): void {
+    this.isMuted = muted;
+    this.audio?.setMuted(muted);
+  }
+
+  get muted(): boolean {
+    return this.isMuted;
   }
 
   stop(): void {
     this.generation++;
     this.isPaused = false;
+    this.audio?.stop();
+    this.audio = null;
     this.renderer?.clear();
     if (this.libav?.terminate) {
       try {
@@ -525,7 +904,11 @@ export class WasmHlsPlayer {
   async load(url: string): Promise<void> {
     this.stop();
     const generation = this.generation;
-    emitStatus({ message: "WASM beta: loading decoder…" });
+
+    // Prime native audio while this call is still on the channel-click gesture;
+    // Chromium may otherwise leave AudioContext suspended by autoplay policy.
+    this.audio = new NativeAacAudio(this.isMuted);
+    emitStatus({ message: `WASM beta: loading decoder… · ${this.audio.status}` });
 
     await loadLibAV();
     if (generation !== this.generation) return;
@@ -654,6 +1037,25 @@ export class WasmHlsPlayer {
     }
 
     const stream = streams[videoIndex];
+
+    const audioType = typeof libav.AVMEDIA_TYPE_AUDIO === "number" ? libav.AVMEDIA_TYPE_AUDIO : 1;
+    const audioIndex = streams.findIndex((candidate: any) => Number(candidate.codec_type) === audioType);
+    const audioStream = audioIndex >= 0 ? streams[audioIndex] : null;
+
+    if (this.audio && audioStream) {
+      try {
+        const [codecName, audioCodecpar] = await Promise.all([
+          libav.avcodec_get_name(audioStream.codec_id),
+          libav.ff_copyout_codecpar(audioStream.codecpar),
+        ]);
+        await this.audio.prepare(codecName, audioCodecpar, snapshot.container);
+      } catch (error) {
+        this.audio.disable(`native audio setup failed: ${error instanceof Error ? error.message : String(error)}`);
+      }
+    } else if (this.audio) {
+      this.audio.disable("no audio track");
+    }
+
     const [, codecContext, packet, frame] = await libav.ff_init_decoder(stream.codec_id, {
       codecpar: stream.codecpar,
       time_base: [stream.time_base_num, stream.time_base_den],
@@ -671,7 +1073,7 @@ export class WasmHlsPlayer {
     const presentationTimes: number[] = [];
 
     emitStatus({
-      message: `WASM beta: decoding H.264 · worker + paced WebGL · ${snapshot.segmentCount}-segment startup buffer${snapshot.seconds ? ` / ~${snapshot.seconds.toFixed(1)}s` : ""}`,
+      message: `WASM beta: decoding H.264 · worker + paced WebGL · ${this.audio?.status ?? "video only"} · ${snapshot.segmentCount}-segment startup buffer${snapshot.seconds ? ` / ~${snapshot.seconds.toFixed(1)}s` : ""}`,
       width: stream.codecpar?.width,
       height: stream.codecpar?.height,
     });
@@ -683,11 +1085,19 @@ export class WasmHlsPlayer {
       const [result, packets] = await libav.ff_read_frame_multi(formatContext, packet, { limit: 128 * 1024 });
       if (generation !== this.generation) break;
 
+      if (audioStream && audioIndex >= 0 && this.audio) {
+        try {
+          await this.audio.pushPackets(packets[audioIndex] || [], audioStream, libav);
+        } catch (error) {
+          this.audio.disable(`native audio failed: ${error instanceof Error ? error.message : String(error)}`);
+        }
+      }
+
       const videoPackets = packets[videoIndex] || [];
       const decodeStart = performance.now();
       const frames = await libav.ff_decode_multi(codecContext, packet, frame, videoPackets, {
         fin: result === libav.AVERROR_EOF,
-        // Packed output removes per-plane stride copies/allocations on the UI thread.
+        // Keep layout metadata: the WebGL Y/U/V uploader consumes these planes directly.
         copyoutFrame: "video",
       });
       decodeMs += performance.now() - decodeStart;
@@ -722,6 +1132,11 @@ export class WasmHlsPlayer {
             baseWallMs = now;
           }
           targetWallMs = baseWallMs + (mediaSeconds - baseMediaSeconds) * 1000;
+
+          const audioTargetWallMs = this.audio?.targetWallMs(mediaSeconds) ?? null;
+          if (audioTargetWallMs !== null) {
+            targetWallMs = audioTargetWallMs;
+          }
 
           if (targetWallMs < now - 1500 || targetWallMs > now + 3000) {
             baseMediaSeconds = mediaSeconds;
@@ -769,7 +1184,7 @@ export class WasmHlsPlayer {
           const displayFps = windowMs > 0 ? (presentationTimes.length - 1) * 1000 / windowMs : 0;
           const decodeFps = decodeMs > 0 ? decodedFrames / (decodeMs / 1000) : 0;
           emitStatus({
-            message: `WASM beta · ${decoded.width}×${decoded.height} · ${displayFps.toFixed(1)} display fps · ${decodeFps.toFixed(1)} decode fps · ${droppedFrames} dropped · live HLS · video only`,
+            message: `WASM beta · ${decoded.width}×${decoded.height} · ${displayFps.toFixed(1)} display fps · ${decodeFps.toFixed(1)} decode fps · ${droppedFrames} dropped · live HLS · ${this.audio?.status ?? "video only"}`,
             frames: presentedFrames,
             decodedFrames,
             droppedFrames,
