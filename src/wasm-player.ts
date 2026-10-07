@@ -1149,28 +1149,111 @@ export class WasmHlsPlayer {
     let lastMediaSeconds: number | null = null;
     let estimatedFrameMs = 1000 / 30;
     let fallbackNextWallMs = performance.now();
+    let lastStatusAt = 0;
+
+    type QueuedVideoFrame = {
+      frame: any;
+      mediaSeconds: number | null;
+      fallbackTargetWallMs: number;
+    };
+
+    const frameQueue: QueuedVideoFrame[] = [];
     const presentationTimes: number[] = [];
     const rafTimes: number[] = [];
 
-    // Measure the browser's actual animation cadence independently of our video
-    // scheduler. This tells us whether a low display FPS is caused by pacing or
-    // by the Tesla Chromium compositor/main thread itself.
-    const sampleRaf = (timestamp: number): void => {
+    const targetFor = (queued: QueuedVideoFrame): number => {
+      if (queued.mediaSeconds !== null) {
+        const audioTarget = this.audio?.targetWallMs(queued.mediaSeconds) ?? null;
+        if (audioTarget !== null) return audioTarget;
+      }
+      return queued.fallbackTargetWallMs;
+    };
+
+    // One compositor-driven presentation loop owns all WebGL draws. Decode is
+    // deliberately decoupled from presentation: the old design awaited rAF for
+    // every decoded frame, which could consume multiple 60 Hz ticks per 30 fps
+    // frame and effectively divide the visible frame rate.
+    const present = (timestamp: number): void => {
       if (generation !== this.generation) return;
+
       rafTimes.push(timestamp);
       while (rafTimes.length > 2 && rafTimes[0] < timestamp - 5000) rafTimes.shift();
-      requestAnimationFrame(sampleRaf);
+
+      if (!this.isPaused && frameQueue.length) {
+        const now = performance.now();
+        let chosenIndex = -1;
+
+        // Present the newest frame whose media timestamp is due. If more than
+        // one frame became due between compositor ticks, skip stale frames and
+        // catch up instead of adding live latency.
+        for (let i = 0; i < frameQueue.length; i++) {
+          if (targetFor(frameQueue[i]) <= now + 4) chosenIndex = i;
+          else break;
+        }
+
+        if (chosenIndex >= 0) {
+          if (chosenIndex > 0) droppedFrames += chosenIndex;
+          const queued = frameQueue[chosenIndex];
+          frameQueue.splice(0, chosenIndex + 1);
+
+          this.renderer!.render(queued.frame);
+          presentedFrames++;
+
+          const presentedAt = performance.now();
+          presentationTimes.push(presentedAt);
+          while (presentationTimes.length > 2 && presentationTimes[0] < presentedAt - 5000) {
+            presentationTimes.shift();
+          }
+
+          if (presentedFrames === 1 || presentedAt - lastStatusAt >= 1000) {
+            lastStatusAt = presentedAt;
+            const windowMs = presentationTimes.length > 1
+              ? presentationTimes[presentationTimes.length - 1] - presentationTimes[0]
+              : 0;
+            const displayFps = windowMs > 0 ? (presentationTimes.length - 1) * 1000 / windowMs : 0;
+            const decodeFps = decodeMs > 0 ? decodedFrames / (decodeMs / 1000) : 0;
+            const rafWindowMs = rafTimes.length > 1 ? rafTimes[rafTimes.length - 1] - rafTimes[0] : 0;
+            const rafFps = rafWindowMs > 0 ? (rafTimes.length - 1) * 1000 / rafWindowMs : 0;
+            const sourceFps = estimatedFrameMs > 0 ? 1000 / estimatedFrameMs : 0;
+
+            emitStatus({
+              message: `WASM beta · ${queued.frame.width}×${queued.frame.height} · ${displayFps.toFixed(1)} display fps · ${sourceFps.toFixed(1)} source fps · ${rafFps.toFixed(1)} rAF fps · ${decodeFps.toFixed(1)} decode fps · ${droppedFrames} dropped · q${frameQueue.length} · live HLS · ${this.audio?.status ?? "video only"}`,
+              frames: presentedFrames,
+              decodedFrames,
+              droppedFrames,
+              width: queued.frame.width,
+              height: queued.frame.height,
+              displayFps,
+              sourceFps,
+              rafFps,
+              decodeFps,
+              frameMs: estimatedFrameMs,
+              queueDepth: frameQueue.length,
+              deliveredSegments,
+            });
+          }
+        }
+      }
+
+      requestAnimationFrame(present);
     };
-    requestAnimationFrame(sampleRaf);
+    requestAnimationFrame(present);
 
     emitStatus({
-      message: `WASM beta: decoding H.264 · worker + paced WebGL · ${this.audio?.status ?? "video only"} · ${snapshot.segmentCount}-segment startup buffer${snapshot.seconds ? ` / ~${snapshot.seconds.toFixed(1)}s` : ""}`,
+      message: `WASM beta: decoding H.264 · rAF frame queue · ${this.audio?.status ?? "video only"} · ${snapshot.segmentCount}-segment startup buffer${snapshot.seconds ? ` / ~${snapshot.seconds.toFixed(1)}s` : ""}`,
       width: stream.codecpar?.width,
       height: stream.codecpar?.height,
     });
 
     while (generation === this.generation) {
       while (this.isPaused && generation === this.generation) await sleep(50);
+      if (generation !== this.generation) break;
+
+      // Bound decoded-frame memory and keep decode close to the live presentation
+      // edge. At 640×360 YUV420, 45 queued frames is roughly a 1.5 s cushion.
+      while (frameQueue.length >= 45 && generation === this.generation && !this.isPaused) {
+        await sleep(10);
+      }
       if (generation !== this.generation) break;
 
       const [result, packets] = await libav.ff_read_frame_multi(formatContext, packet, { limit: 128 * 1024 });
@@ -1196,8 +1279,6 @@ export class WasmHlsPlayer {
 
       for (const decoded of frames) {
         if (generation !== this.generation) break;
-        while (this.isPaused && generation === this.generation) await sleep(50);
-        if (generation !== this.generation) break;
 
         const timestamp = frameTimestamp(libav, decoded);
         const tbNum = decoded.time_base_num || stream.time_base_num;
@@ -1207,7 +1288,7 @@ export class WasmHlsPlayer {
           : null;
 
         const now = performance.now();
-        let targetWallMs: number;
+        let fallbackTargetWallMs: number;
 
         if (mediaSeconds !== null && Number.isFinite(mediaSeconds)) {
           if (lastMediaSeconds !== null) {
@@ -1222,80 +1303,34 @@ export class WasmHlsPlayer {
             baseMediaSeconds = mediaSeconds;
             baseWallMs = now;
           }
-          targetWallMs = baseWallMs + (mediaSeconds - baseMediaSeconds) * 1000;
 
-          const audioTargetWallMs = this.audio?.targetWallMs(mediaSeconds) ?? null;
-          if (audioTargetWallMs !== null) {
-            targetWallMs = audioTargetWallMs;
-          }
+          fallbackTargetWallMs = baseWallMs + (mediaSeconds - baseMediaSeconds) * 1000;
 
-          if (targetWallMs < now - 1500 || targetWallMs > now + 3000) {
+          if (fallbackTargetWallMs < now - 1500 || fallbackTargetWallMs > now + 3000) {
             baseMediaSeconds = mediaSeconds;
             baseWallMs = now;
-            targetWallMs = now;
+            fallbackTargetWallMs = now;
           }
-          fallbackNextWallMs = targetWallMs + estimatedFrameMs;
+          fallbackNextWallMs = fallbackTargetWallMs + estimatedFrameMs;
         } else {
-          targetWallMs = Math.max(now, fallbackNextWallMs);
-          fallbackNextWallMs = targetWallMs + estimatedFrameMs;
+          fallbackTargetWallMs = Math.max(now, fallbackNextWallMs);
+          fallbackNextWallMs = fallbackTargetWallMs + estimatedFrameMs;
         }
 
-        // If we are already more than one frame late, discard this frame rather
-        // than growing latency. Live TV should catch up to the clock, not queue.
-        if (targetWallMs < performance.now() - estimatedFrameMs) {
-          droppedFrames++;
-          continue;
-        }
-
-        // Do not sleep until just before the target and then incur a whole extra
-        // rAF interval. Wake early, then advance rAF-by-rAF to the first browser
-        // presentation opportunity at (or immediately before) the target.
-        let remaining = targetWallMs - performance.now();
-        if (remaining > 40) await sleep(remaining - 32);
-
-        let rafTime = await nextAnimationFrame();
-        while (rafTime < targetWallMs - 4 && generation === this.generation) {
-          rafTime = await nextAnimationFrame();
-        }
-        if (generation !== this.generation) break;
-
-        this.renderer.render(decoded);
-        presentedFrames++;
-
-        const presentedAt = performance.now();
-        presentationTimes.push(presentedAt);
-        while (presentationTimes.length > 2 && presentationTimes[0] < presentedAt - 5000) {
-          presentationTimes.shift();
-        }
-
-        if (presentedFrames === 1 || presentedFrames % 30 === 0) {
-          const windowMs = presentationTimes.length > 1
-            ? presentationTimes[presentationTimes.length - 1] - presentationTimes[0]
-            : 0;
-          const displayFps = windowMs > 0 ? (presentationTimes.length - 1) * 1000 / windowMs : 0;
-          const decodeFps = decodeMs > 0 ? decodedFrames / (decodeMs / 1000) : 0;
-          const rafWindowMs = rafTimes.length > 1 ? rafTimes[rafTimes.length - 1] - rafTimes[0] : 0;
-          const rafFps = rafWindowMs > 0 ? (rafTimes.length - 1) * 1000 / rafWindowMs : 0;
-          emitStatus({
-            message: `WASM beta · ${decoded.width}×${decoded.height} · ${displayFps.toFixed(1)} display fps · ${rafFps.toFixed(1)} rAF fps · ${decodeFps.toFixed(1)} decode fps · ${droppedFrames} dropped · live HLS · ${this.audio?.status ?? "video only"}`,
-            frames: presentedFrames,
-            decodedFrames,
-            droppedFrames,
-            width: decoded.width,
-            height: decoded.height,
-            displayFps,
-            rafFps,
-            decodeFps,
-            frameMs: estimatedFrameMs,
-            deliveredSegments,
-          });
-        }
+        frameQueue.push({
+          frame: decoded,
+          mediaSeconds,
+          fallbackTargetWallMs,
+        });
       }
 
       if (result === libav.AVERROR_EOF) {
+        // Allow already-decoded frames to drain before declaring the source done.
+        while (frameQueue.length && generation === this.generation) await sleep(20);
         emitStatus({ message: "WASM beta: stream ended (HLS source reached EOF)" });
         break;
       }
+    }
     }
   }
 }
