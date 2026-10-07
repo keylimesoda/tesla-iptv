@@ -688,7 +688,7 @@ export class WasmHlsPlayer {
       const frames = await libav.ff_decode_multi(codecContext, packet, frame, videoPackets, {
         fin: result === libav.AVERROR_EOF,
         // Packed output removes per-plane stride copies/allocations on the UI thread.
-        copyoutFrame: "video_packed",
+        copyoutFrame: "video",
       });
       decodeMs += performance.now() - decodeStart;
       decodedFrames += frames.length;
