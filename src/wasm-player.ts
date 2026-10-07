@@ -46,6 +46,13 @@ type HlsProbe = {
   variants: Array<{ url: string; bandwidth: number; codecs: string }>;
 };
 
+type MediaSegment = {
+  url: string;
+  duration: number;
+  sequence: number;
+  key: string;
+};
+
 async function probePlaylist(url: string): Promise<HlsProbe> {
   const response = await fetch(url, { cache: "no-store" });
   if (!response.ok) throw new Error(`playlist HTTP ${response.status}`);
@@ -53,8 +60,8 @@ async function probePlaylist(url: string): Promise<HlsProbe> {
   const text = await response.text();
   const contentType = response.headers.get("content-type") || "";
   const lines = text.split(/\r?\n/).map((line) => line.trim()).filter(Boolean);
+  const variants: HlsProbe["variants"] = [];
 
-  const variants: Array<{ url: string; bandwidth: number; codecs: string }> = [];
   for (let i = 0; i < lines.length; i++) {
     if (!lines[i].startsWith("#EXT-X-STREAM-INF:")) continue;
     const attrs = lines[i].slice("#EXT-X-STREAM-INF:".length);
@@ -96,9 +103,7 @@ async function resolveH264MediaPlaylist(url: string): Promise<{ probe: HlsProbe;
       `${probe.kind} HTTP ${probe.status}${probe.contentType ? ` ${probe.contentType.split(";")[0]}` : ""}`,
     );
 
-    if (probe.kind !== "master") {
-      return { probe, diagnostic: trail.join(" → ") };
-    }
+    if (probe.kind !== "master") return { probe, diagnostic: trail.join(" → ") };
 
     const explicitlyH264 = probe.variants.filter((variant) =>
       /(?:^|,)(?:avc1|avc3)\./i.test(variant.codecs),
@@ -125,13 +130,6 @@ async function resolveH264MediaPlaylist(url: string): Promise<{ probe: HlsProbe;
   throw new Error("HLS master playlist nesting is deeper than expected");
 }
 
-type MediaSegment = {
-  url: string;
-  duration: number;
-  sequence: number;
-  key: string;
-};
-
 function parseMediaSegments(probe: HlsProbe): {
   initUrl: string | null;
   segments: MediaSegment[];
@@ -152,12 +150,10 @@ function parseMediaSegments(probe: HlsProbe): {
       mediaSequence = Number(line.slice("#EXT-X-MEDIA-SEQUENCE:".length)) || 0;
       continue;
     }
-
     if (/^#EXT-X-TARGETDURATION:/i.test(line)) {
       targetDuration = Number(line.slice("#EXT-X-TARGETDURATION:".length)) || 0;
       continue;
     }
-
     if (/^#EXT-X-KEY:/i.test(line)) {
       const method = line.match(/METHOD=([^,]*)/i)?.[1]?.toUpperCase();
       if (method && method !== "NONE") {
@@ -165,22 +161,18 @@ function parseMediaSegments(probe: HlsProbe): {
       }
       continue;
     }
-
     if (/^#EXT-X-BYTERANGE:/i.test(line)) {
       throw new Error("HLS byte-range segments are not enabled in the WASM beta");
     }
-
     if (/^#EXT-X-MAP:/i.test(line)) {
       const uri = line.match(/URI="([^"]+)"/i)?.[1];
       if (uri) initUrl = new URL(uri, probe.url).href;
       continue;
     }
-
     if (/^#EXTINF:/i.test(line)) {
       pendingDuration = Number(line.slice("#EXTINF:".length).split(",")[0]) || 0;
       continue;
     }
-
     if (line.startsWith("#")) continue;
 
     const sequence = mediaSequence + segments.length;
@@ -215,10 +207,7 @@ function concatBytes(parts: Uint8Array[]): Uint8Array {
 
 function sniffContainer(data: Uint8Array, firstUrl: string, hasInit: boolean): "mpegts" | "mp4" {
   if (hasInit) return "mp4";
-
-  if (data.length >= 376 && data[0] === 0x47 && data[188] === 0x47) {
-    return "mpegts";
-  }
+  if (data.length >= 376 && data[0] === 0x47 && data[188] === 0x47) return "mpegts";
 
   if (data.length >= 8) {
     const box = String.fromCharCode(data[4], data[5], data[6], data[7]);
@@ -227,9 +216,7 @@ function sniffContainer(data: Uint8Array, firstUrl: string, hasInit: boolean): "
 
   const pathname = new URL(firstUrl).pathname.toLowerCase();
   if (pathname.endsWith(".ts") || pathname.endsWith(".mpegts")) return "mpegts";
-  if (pathname.endsWith(".m4s") || pathname.endsWith(".mp4") || pathname.endsWith(".cmfv")) {
-    return "mp4";
-  }
+  if (pathname.endsWith(".m4s") || pathname.endsWith(".mp4") || pathname.endsWith(".cmfv")) return "mp4";
 
   throw new Error(
     `could not identify media container (first bytes ${Array.from(data.slice(0, 8))
@@ -327,6 +314,7 @@ class YuvRenderer {
   private program: WebGLProgram;
   private textures: WebGLTexture[];
   private textureSizes: Array<[number, number] | null> = [null, null, null];
+  private viewportKey = "";
 
   constructor(private canvas: HTMLCanvasElement) {
     const gl = canvas.getContext("webgl", {
@@ -390,11 +378,7 @@ class YuvRenderer {
     const buffer = gl.createBuffer();
     if (!buffer) throw new Error("Could not create WebGL buffer");
     gl.bindBuffer(gl.ARRAY_BUFFER, buffer);
-    gl.bufferData(
-      gl.ARRAY_BUFFER,
-      new Float32Array([-1, -1, 1, -1, -1, 1, 1, 1]),
-      gl.STATIC_DRAW,
-    );
+    gl.bufferData(gl.ARRAY_BUFFER, new Float32Array([-1, -1, 1, -1, -1, 1, 1, 1]), gl.STATIC_DRAW);
     const position = gl.getAttribLocation(program, "aPos");
     gl.enableVertexAttribArray(position);
     gl.vertexAttribPointer(position, 2, gl.FLOAT, false, 0, 0);
@@ -412,11 +396,7 @@ class YuvRenderer {
       return texture;
     };
 
-    this.textures = [
-      makeTexture(0, "yTex"),
-      makeTexture(1, "uTex"),
-      makeTexture(2, "vTex"),
-    ];
+    this.textures = [makeTexture(0, "yTex"), makeTexture(1, "uTex"), makeTexture(2, "vTex")];
     gl.pixelStorei(gl.UNPACK_ALIGNMENT, 1);
   }
 
@@ -431,10 +411,7 @@ class YuvRenderer {
     const out = new Uint8Array(width * height);
     for (let y = 0; y < height; y++) {
       out.set(
-        frame.data.subarray(
-          layout.offset + y * layout.stride,
-          layout.offset + y * layout.stride + width,
-        ),
+        frame.data.subarray(layout.offset + y * layout.stride, layout.offset + y * layout.stride + width),
         y * width,
       );
     }
@@ -448,32 +425,12 @@ class YuvRenderer {
 
     const oldSize = this.textureSizes[unit];
     if (!oldSize || oldSize[0] !== width || oldSize[1] !== height) {
-      gl.texImage2D(
-        gl.TEXTURE_2D,
-        0,
-        gl.LUMINANCE,
-        width,
-        height,
-        0,
-        gl.LUMINANCE,
-        gl.UNSIGNED_BYTE,
-        data,
-      );
+      gl.texImage2D(gl.TEXTURE_2D, 0, gl.LUMINANCE, width, height, 0, gl.LUMINANCE, gl.UNSIGNED_BYTE, data);
       this.textureSizes[unit] = [width, height];
       return;
     }
 
-    gl.texSubImage2D(
-      gl.TEXTURE_2D,
-      0,
-      0,
-      0,
-      width,
-      height,
-      gl.LUMINANCE,
-      gl.UNSIGNED_BYTE,
-      data,
-    );
+    gl.texSubImage2D(gl.TEXTURE_2D, 0, 0, 0, width, height, gl.LUMINANCE, gl.UNSIGNED_BYTE, data);
   }
 
   render(frame: any): void {
@@ -490,26 +447,30 @@ class YuvRenderer {
     this.upload(1, chromaWidth, chromaHeight, this.plane(frame, 1, chromaWidth, chromaHeight));
     this.upload(2, chromaWidth, chromaHeight, this.plane(frame, 2, chromaWidth, chromaHeight));
 
-    const cssWidth = Math.max(1, this.canvas.clientWidth);
-    const cssHeight = Math.max(1, this.canvas.clientHeight);
-    const dpr = Math.min(window.devicePixelRatio || 1, 2);
-    const pixelWidth = Math.round(cssWidth * dpr);
-    const pixelHeight = Math.round(cssHeight * dpr);
+    const pixelWidth = Math.max(1, Math.round(this.canvas.clientWidth));
+    const pixelHeight = Math.max(1, Math.round(this.canvas.clientHeight));
     if (this.canvas.width !== pixelWidth || this.canvas.height !== pixelHeight) {
       this.canvas.width = pixelWidth;
       this.canvas.height = pixelHeight;
+      this.viewportKey = "";
     }
-
-    const gl = this.gl;
-    gl.clearColor(0, 0, 0, 1);
-    gl.clear(gl.COLOR_BUFFER_BIT);
 
     const scale = Math.min(pixelWidth / width, pixelHeight / height);
     const outputWidth = Math.round(width * scale);
     const outputHeight = Math.round(height * scale);
     const x = Math.floor((pixelWidth - outputWidth) / 2);
     const y = Math.floor((pixelHeight - outputHeight) / 2);
-    gl.viewport(x, y, outputWidth, outputHeight);
+    const viewportKey = `${x},${y},${outputWidth},${outputHeight},${pixelWidth},${pixelHeight}`;
+
+    const gl = this.gl;
+    if (viewportKey !== this.viewportKey) {
+      gl.viewport(0, 0, pixelWidth, pixelHeight);
+      gl.clearColor(0, 0, 0, 1);
+      gl.clear(gl.COLOR_BUFFER_BIT);
+      gl.viewport(x, y, outputWidth, outputHeight);
+      this.viewportKey = viewportKey;
+    }
+
     gl.useProgram(this.program);
     gl.drawArrays(gl.TRIANGLE_STRIP, 0, 4);
   }
@@ -519,6 +480,7 @@ class YuvRenderer {
     gl.viewport(0, 0, this.canvas.width, this.canvas.height);
     gl.clearColor(0, 0, 0, 1);
     gl.clear(gl.COLOR_BUFFER_BIT);
+    this.viewportKey = "";
   }
 }
 
@@ -572,7 +534,10 @@ export class WasmHlsPlayer {
     if (!factory) throw new Error("libav.js loaded without LibAV factory");
 
     this.renderer ??= new YuvRenderer(this.canvas);
-    const libav = await factory({ noworker: true });
+
+    // HLS transport now lives in the page, so libav can safely go back to its
+    // worker. Keeping H.264 decode off the UI thread is important for stable rAF.
+    const libav = await factory();
     if (generation !== this.generation) {
       libav.terminate?.();
       return;
@@ -622,7 +587,6 @@ export class WasmHlsPlayer {
             const init = await fetchBytes(parsed.initUrl, "HLS init segment");
             await libav.ff_reader_dev_send(readerName, init.data);
             currentInitUrl = parsed.initUrl;
-            emitStatus({ message: "WASM beta: HLS init segment updated" });
             return;
           }
 
@@ -682,7 +646,6 @@ export class WasmHlsPlayer {
     const streamSummary = streams
       .map((candidate: any, index: number) => `${index}:type=${candidate.codec_type},codec=${candidate.codec_id}`)
       .join(" ");
-
     const videoIndex = streams.findIndex((candidate: any) => Number(candidate.codec_type) === videoType);
     if (videoIndex < 0) {
       throw new Error(
@@ -691,27 +654,24 @@ export class WasmHlsPlayer {
     }
 
     const stream = streams[videoIndex];
-    const [, codecContext, packet, frame] = await libav.ff_init_decoder(
-      stream.codec_id,
-      {
-        codecpar: stream.codecpar,
-        time_base: [stream.time_base_num, stream.time_base_den],
-      },
-    );
+    const [, codecContext, packet, frame] = await libav.ff_init_decoder(stream.codec_id, {
+      codecpar: stream.codecpar,
+      time_base: [stream.time_base_num, stream.time_base_den],
+    });
 
     let decodedFrames = 0;
     let presentedFrames = 0;
-    let decodeCpuMs = 0;
-    const playbackStarted = performance.now();
-
+    let droppedFrames = 0;
+    let decodeMs = 0;
     let baseMediaSeconds: number | null = null;
     let baseWallMs = performance.now();
     let lastMediaSeconds: number | null = null;
     let estimatedFrameMs = 1000 / 30;
     let fallbackNextWallMs = performance.now();
+    const presentationTimes: number[] = [];
 
     emitStatus({
-      message: `WASM beta: decoding H.264 · paced WebGL · ${snapshot.segmentCount}-segment startup buffer${snapshot.seconds ? ` / ~${snapshot.seconds.toFixed(1)}s` : ""}`,
+      message: `WASM beta: decoding H.264 · worker + paced WebGL · ${snapshot.segmentCount}-segment startup buffer${snapshot.seconds ? ` / ~${snapshot.seconds.toFixed(1)}s` : ""}`,
       width: stream.codecpar?.width,
       height: stream.codecpar?.height,
     });
@@ -720,26 +680,17 @@ export class WasmHlsPlayer {
       while (this.isPaused && generation === this.generation) await sleep(50);
       if (generation !== this.generation) break;
 
-      const [result, packets] = await libav.ff_read_frame_multi(
-        formatContext,
-        packet,
-        { limit: 512 * 1024 },
-      );
+      const [result, packets] = await libav.ff_read_frame_multi(formatContext, packet, { limit: 128 * 1024 });
       if (generation !== this.generation) break;
 
       const videoPackets = packets[videoIndex] || [];
       const decodeStart = performance.now();
-      const frames = await libav.ff_decode_multi(
-        codecContext,
-        packet,
-        frame,
-        videoPackets,
-        {
-          fin: result === libav.AVERROR_EOF,
-          copyoutFrame: "video",
-        },
-      );
-      decodeCpuMs += performance.now() - decodeStart;
+      const frames = await libav.ff_decode_multi(codecContext, packet, frame, videoPackets, {
+        fin: result === libav.AVERROR_EOF,
+        // Packed output removes per-plane stride copies/allocations on the UI thread.
+        copyoutFrame: "video_packed",
+      });
+      decodeMs += performance.now() - decodeStart;
       decodedFrames += frames.length;
 
       for (const decoded of frames) {
@@ -772,7 +723,7 @@ export class WasmHlsPlayer {
           }
           targetWallMs = baseWallMs + (mediaSeconds - baseMediaSeconds) * 1000;
 
-          if (targetWallMs < now - 750 || targetWallMs > now + 3000) {
+          if (targetWallMs < now - 1500 || targetWallMs > now + 3000) {
             baseMediaSeconds = mediaSeconds;
             baseWallMs = now;
             targetWallMs = now;
@@ -783,28 +734,51 @@ export class WasmHlsPlayer {
           fallbackNextWallMs = targetWallMs + estimatedFrameMs;
         }
 
-        const waitMs = targetWallMs - performance.now();
-        if (waitMs > 12) await sleep(waitMs - 8);
+        // If we are already more than one frame late, discard this frame rather
+        // than growing latency. Live TV should catch up to the clock, not queue.
+        if (targetWallMs < performance.now() - estimatedFrameMs) {
+          droppedFrames++;
+          continue;
+        }
 
-        await nextAnimationFrame();
+        // Do not sleep until just before the target and then incur a whole extra
+        // rAF interval. Wake early, then advance rAF-by-rAF to the first browser
+        // presentation opportunity at (or immediately before) the target.
+        let remaining = targetWallMs - performance.now();
+        if (remaining > 40) await sleep(remaining - 32);
+
+        let rafTime = await nextAnimationFrame();
+        while (rafTime < targetWallMs - 4 && generation === this.generation) {
+          rafTime = await nextAnimationFrame();
+        }
         if (generation !== this.generation) break;
 
         this.renderer.render(decoded);
         presentedFrames++;
 
+        const presentedAt = performance.now();
+        presentationTimes.push(presentedAt);
+        while (presentationTimes.length > 2 && presentationTimes[0] < presentedAt - 5000) {
+          presentationTimes.shift();
+        }
+
         if (presentedFrames === 1 || presentedFrames % 30 === 0) {
-          const elapsedSeconds = Math.max(0.001, (performance.now() - playbackStarted) / 1000);
-          const displayFps = presentedFrames / elapsedSeconds;
-          const decodeFps = decodeCpuMs > 0 ? decodedFrames / (decodeCpuMs / 1000) : 0;
+          const windowMs = presentationTimes.length > 1
+            ? presentationTimes[presentationTimes.length - 1] - presentationTimes[0]
+            : 0;
+          const displayFps = windowMs > 0 ? (presentationTimes.length - 1) * 1000 / windowMs : 0;
+          const decodeFps = decodeMs > 0 ? decodedFrames / (decodeMs / 1000) : 0;
           emitStatus({
-            message: `WASM beta · ${decoded.width}×${decoded.height} · ${displayFps.toFixed(1)} display fps · ${decodeFps.toFixed(1)} decode fps · live HLS · video only`,
+            message: `WASM beta · ${decoded.width}×${decoded.height} · ${displayFps.toFixed(1)} display fps · ${decodeFps.toFixed(1)} decode fps · ${droppedFrames} dropped · live HLS · video only`,
             frames: presentedFrames,
             decodedFrames,
+            droppedFrames,
             width: decoded.width,
             height: decoded.height,
             displayFps,
             decodeFps,
             frameMs: estimatedFrameMs,
+            deliveredSegments,
           });
         }
       }
