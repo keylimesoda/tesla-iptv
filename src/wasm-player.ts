@@ -1159,31 +1159,24 @@ export class WasmHlsPlayer {
     let presentedFrames = 0;
     let droppedFrames = 0;
     let decodeMs = 0;
-    let baseMediaSeconds: number | null = null;
-    let baseWallMs = performance.now();
     let lastMediaSeconds: number | null = null;
     let estimatedFrameMs = 1000 / 30;
-    let fallbackNextWallMs = performance.now();
-    let lastAvCorrectionAt = 0;
+    let nextPresentationWallMs: number | null = null;
     let avDriftMs = 0;
     let lastStatusAt = 0;
 
     type QueuedVideoFrame = {
       frame: any;
       mediaSeconds: number | null;
-      fallbackTargetWallMs: number;
     };
 
     const frameQueue: QueuedVideoFrame[] = [];
     const presentationTimes: number[] = [];
     const rafTimes: number[] = [];
 
-    const targetFor = (queued: QueuedVideoFrame): number => queued.fallbackTargetWallMs;
-
-    // One compositor-driven presentation loop owns all WebGL draws. Decode is
-    // deliberately decoupled from presentation: the old design awaited rAF for
-    // every decoded frame, which could consume multiple 60 Hz ticks per 30 fps
-    // frame and effectively divide the visible frame rate.
+    // Cadence-first presenter: source PTS determines the frame interval, while
+    // audio is used only for phase correction/catch-up. This makes 30 fps mean
+    // one frame every ~33.3 ms regardless of demux/decode burst shape.
     const present = (timestamp: number): void => {
       if (generation !== this.generation) return;
 
@@ -1192,17 +1185,31 @@ export class WasmHlsPlayer {
 
       if (!this.isPaused && frameQueue.length) {
         const now = performance.now();
-        let chosenIndex = -1;
 
-        // Present the newest frame whose media timestamp is due. If more than
-        // one frame became due between compositor ticks, skip stale frames and
-        // catch up instead of adding live latency.
-        for (let i = 0; i < frameQueue.length; i++) {
-          if (targetFor(frameQueue[i]) <= now + 4) chosenIndex = i;
-          else break;
+        if (nextPresentationWallMs === null) {
+          const first = frameQueue[0];
+          const audioTarget = first.mediaSeconds !== null
+            ? this.audio?.targetWallMs(first.mediaSeconds) ?? null
+            : null;
+          nextPresentationWallMs = audioTarget !== null
+            ? Math.max(now, audioTarget)
+            : now;
         }
 
-        if (chosenIndex >= 0) {
+        if (now + 4 >= nextPresentationWallMs) {
+          let chosenIndex = 0;
+
+          // Audio is a sync reference, not the cadence clock. If the queue head
+          // is materially late relative to audio, discard only enough stale
+          // frames to get back near the audio playhead.
+          for (let i = 0; i < frameQueue.length - 1; i++) {
+            const mediaSeconds = frameQueue[i].mediaSeconds;
+            if (mediaSeconds === null) break;
+            const audioTarget = this.audio?.targetWallMs(mediaSeconds) ?? null;
+            if (audioTarget === null || audioTarget >= now - Math.max(80, estimatedFrameMs * 2)) break;
+            chosenIndex = i + 1;
+          }
+
           if (chosenIndex > 0) droppedFrames += chosenIndex;
           const queued = frameQueue[chosenIndex];
           frameQueue.splice(0, chosenIndex + 1);
@@ -1214,6 +1221,36 @@ export class WasmHlsPlayer {
           presentationTimes.push(presentedAt);
           while (presentationTimes.length > 2 && presentationTimes[0] < presentedAt - 5000) {
             presentationTimes.shift();
+          }
+
+          // Advance by the source cadence. Use adjacent PTS when available;
+          // otherwise fall back to the rolling estimate.
+          let intervalMs = estimatedFrameMs;
+          if (queued.mediaSeconds !== null && frameQueue.length && frameQueue[0].mediaSeconds !== null) {
+            const ptsDeltaMs = (frameQueue[0].mediaSeconds! - queued.mediaSeconds) * 1000;
+            if (ptsDeltaMs >= 4 && ptsDeltaMs <= 250) intervalMs = ptsDeltaMs;
+          }
+          nextPresentationWallMs += intervalMs;
+
+          // Phase-lock gently to audio without stretching video cadence. Large
+          // discontinuities re-anchor immediately; normal drift gets <=1 ms of
+          // correction per rendered frame.
+          if (queued.mediaSeconds !== null) {
+            const audioTarget = this.audio?.targetWallMs(queued.mediaSeconds) ?? null;
+            if (audioTarget !== null) {
+              avDriftMs = audioTarget - presentedAt;
+              if (Math.abs(avDriftMs) > 250) {
+                nextPresentationWallMs += avDriftMs;
+              } else {
+                nextPresentationWallMs += Math.max(-1, Math.min(1, avDriftMs * 0.05));
+              }
+            }
+          }
+
+          // If the main thread ever stalls badly, recover rather than running a
+          // long burst of old frames.
+          if (nextPresentationWallMs < presentedAt - intervalMs * 2) {
+            nextPresentationWallMs = presentedAt + intervalMs;
           }
 
           if (presentedFrames === 1 || presentedAt - lastStatusAt >= 1000) {
@@ -1252,7 +1289,7 @@ export class WasmHlsPlayer {
     requestAnimationFrame(present);
 
     emitStatus({
-      message: `WASM beta: decoding H.264 · rAF frame queue · ${this.audio?.status ?? "video only"} · ${snapshot.segmentCount}-segment startup buffer${snapshot.seconds ? ` / ~${snapshot.seconds.toFixed(1)}s` : ""}`,
+      message: `WASM beta: decoding H.264 · cadence-first rAF queue · ${this.audio?.status ?? "video only"} · ${snapshot.segmentCount}-segment startup buffer${snapshot.seconds ? ` / ~${snapshot.seconds.toFixed(1)}s` : ""}`,
       width: stream.codecpar?.width,
       height: stream.codecpar?.height,
     });
@@ -1261,10 +1298,11 @@ export class WasmHlsPlayer {
       while (this.isPaused && generation === this.generation) await sleep(50);
       if (generation !== this.generation) break;
 
-      // Bound decoded-frame memory and keep decode close to the live presentation
-      // edge. At 640×360 YUV420, 45 queued frames is roughly a 1.5 s cushion.
-      while (frameQueue.length >= 45 && generation === this.generation && !this.isPaused) {
-        await sleep(10);
+      // Keep only a modest decoded cushion. At 1080p a YUV420 frame is ~3 MiB,
+      // so the old ~45-frame queue could retain well over 100 MiB and create
+      // avoidable GC/memory pressure. 12 frames is ~400 ms at 30 fps.
+      while (frameQueue.length >= 12 && generation === this.generation && !this.isPaused) {
+        await sleep(5);
       }
       if (generation !== this.generation) break;
 
@@ -1283,7 +1321,6 @@ export class WasmHlsPlayer {
       const decodeStart = performance.now();
       const frames = await libav.ff_decode_multi(codecContext, packet, frame, videoPackets, {
         fin: result === libav.AVERROR_EOF,
-        // Keep layout metadata: the WebGL Y/U/V uploader consumes these planes directly.
         copyoutFrame: "video",
       });
       decodeMs += performance.now() - decodeStart;
@@ -1292,15 +1329,12 @@ export class WasmHlsPlayer {
       for (const decoded of frames) {
         if (generation !== this.generation) break;
 
-        const timestamp = frameTimestamp(libav, decoded);
+        const framePts = frameTimestamp(libav, decoded);
         const tbNum = decoded.time_base_num || stream.time_base_num;
         const tbDen = decoded.time_base_den || stream.time_base_den;
-        const mediaSeconds = timestamp !== null && tbNum && tbDen
-          ? timestamp * tbNum / tbDen
+        const mediaSeconds = framePts !== null && tbNum && tbDen
+          ? framePts * tbNum / tbDen
           : null;
-
-        const now = performance.now();
-        let fallbackTargetWallMs: number;
 
         if (mediaSeconds !== null && Number.isFinite(mediaSeconds)) {
           if (lastMediaSeconds !== null) {
@@ -1310,54 +1344,12 @@ export class WasmHlsPlayer {
             }
           }
           lastMediaSeconds = mediaSeconds;
-
-          if (baseMediaSeconds === null) {
-            baseMediaSeconds = mediaSeconds;
-            baseWallMs = now;
-          }
-
-          fallbackTargetWallMs = baseWallMs + (mediaSeconds - baseMediaSeconds) * 1000;
-
-          // Preserve the source PTS cadence (e.g. 30 fps) and use audio only
-          // as a phase reference. Driving every video frame directly from the
-          // audio target was measurably slowing 30 fps feeds to ~25 fps on the
-          // Tesla. Small periodic corrections keep A/V sync without changing
-          // the video's nominal frame rate.
-          const audioTarget = this.audio?.targetWallMs(mediaSeconds) ?? null;
-          if (audioTarget !== null) {
-            avDriftMs = audioTarget - fallbackTargetWallMs;
-            if (Math.abs(avDriftMs) > 250) {
-              baseWallMs += avDriftMs;
-              fallbackTargetWallMs += avDriftMs;
-              lastAvCorrectionAt = now;
-            } else if (now - lastAvCorrectionAt >= 1000) {
-              const correction = Math.max(-8, Math.min(8, avDriftMs));
-              baseWallMs += correction;
-              fallbackTargetWallMs += correction;
-              lastAvCorrectionAt = now;
-            }
-          }
-
-          if (fallbackTargetWallMs < now - 1500 || fallbackTargetWallMs > now + 3000) {
-            baseMediaSeconds = mediaSeconds;
-            baseWallMs = now;
-            fallbackTargetWallMs = now;
-          }
-          fallbackNextWallMs = fallbackTargetWallMs + estimatedFrameMs;
-        } else {
-          fallbackTargetWallMs = Math.max(now, fallbackNextWallMs);
-          fallbackNextWallMs = fallbackTargetWallMs + estimatedFrameMs;
         }
 
-        frameQueue.push({
-          frame: decoded,
-          mediaSeconds,
-          fallbackTargetWallMs,
-        });
+        frameQueue.push({ frame: decoded, mediaSeconds });
       }
 
       if (result === libav.AVERROR_EOF) {
-        // Allow already-decoded frames to drain before declaring the source done.
         while (frameQueue.length && generation === this.generation) await sleep(20);
         emitStatus({ message: "WASM beta: stream ended (HLS source reached EOF)" });
         break;
