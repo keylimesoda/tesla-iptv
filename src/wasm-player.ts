@@ -43,7 +43,7 @@ type HlsProbe = {
   status: number;
   contentType: string;
   text: string;
-  variants: Array<{ url: string; bandwidth: number; codecs: string }>;
+  variants: Array<{ url: string; bandwidth: number; codecs: string; width: number; height: number }>;
 };
 
 type MediaSegment = {
@@ -67,12 +67,17 @@ async function probePlaylist(url: string): Promise<HlsProbe> {
     const attrs = lines[i].slice("#EXT-X-STREAM-INF:".length);
     const bandwidth = Number(attrs.match(/(?:^|,)BANDWIDTH=(\d+)/)?.[1] || 0);
     const codecs = attrs.match(/(?:^|,)CODECS="([^"]*)"/)?.[1] || "";
+    const resolution = attrs.match(/(?:^|,)RESOLUTION=(\d+)x(\d+)/i);
+    const width = Number(resolution?.[1] || 0);
+    const height = Number(resolution?.[2] || 0);
     const uri = lines.slice(i + 1).find((line) => !line.startsWith("#"));
     if (uri) {
       variants.push({
         url: new URL(uri, response.url || url).href,
         bandwidth,
         codecs,
+        width,
+        height,
       });
     }
   }
@@ -109,13 +114,20 @@ async function resolveH264MediaPlaylist(url: string): Promise<{ probe: HlsProbe;
       /(?:^|,)(?:avc1|avc3)\./i.test(variant.codecs),
     );
     const candidates = explicitlyH264.length ? explicitlyH264 : probe.variants;
-    candidates.sort((a, b) => {
-      const aBandwidth = a.bandwidth || Number.MAX_SAFE_INTEGER;
-      const bBandwidth = b.bandwidth || Number.MAX_SAFE_INTEGER;
-      return aBandwidth - bBandwidth;
+
+    // The original WASM proof intentionally picked the lowest-bandwidth rung,
+    // which is why many channels appeared as 234p/360p even when their HLS
+    // master advertised HD. For the real player, prefer the best H.264 rendition
+    // up through 1080p. (A later UI can make this user-selectable.)
+    const atOrBelow1080 = candidates.filter((variant) => !variant.height || variant.height <= 1080);
+    const qualityPool = atOrBelow1080.length ? atOrBelow1080 : candidates;
+    qualityPool.sort((a, b) => {
+      if (a.height !== b.height) return b.height - a.height;
+      if (a.width !== b.width) return b.width - a.width;
+      return (b.bandwidth || 0) - (a.bandwidth || 0);
     });
 
-    const selected = candidates[0];
+    const selected = qualityPool[0];
     if (!selected) throw new Error("master playlist contains no variants");
 
     const allCodecsKnown = probe.variants.every((variant) => variant.codecs);
@@ -124,6 +136,9 @@ async function resolveH264MediaPlaylist(url: string): Promise<{ probe: HlsProbe;
       throw new Error(`master playlist has no H.264 variant (CODECS: ${codecs})`);
     }
 
+    trail.push(
+      `H.264 ${selected.width && selected.height ? `${selected.width}×${selected.height}` : "variant"}${selected.bandwidth ? ` @ ${(selected.bandwidth / 1_000_000).toFixed(1)} Mbps` : ""}`,
+    );
     current = selected.url;
   }
 
@@ -1149,6 +1164,8 @@ export class WasmHlsPlayer {
     let lastMediaSeconds: number | null = null;
     let estimatedFrameMs = 1000 / 30;
     let fallbackNextWallMs = performance.now();
+    let lastAvCorrectionAt = 0;
+    let avDriftMs = 0;
     let lastStatusAt = 0;
 
     type QueuedVideoFrame = {
@@ -1161,13 +1178,7 @@ export class WasmHlsPlayer {
     const presentationTimes: number[] = [];
     const rafTimes: number[] = [];
 
-    const targetFor = (queued: QueuedVideoFrame): number => {
-      if (queued.mediaSeconds !== null) {
-        const audioTarget = this.audio?.targetWallMs(queued.mediaSeconds) ?? null;
-        if (audioTarget !== null) return audioTarget;
-      }
-      return queued.fallbackTargetWallMs;
-    };
+    const targetFor = (queued: QueuedVideoFrame): number => queued.fallbackTargetWallMs;
 
     // One compositor-driven presentation loop owns all WebGL draws. Decode is
     // deliberately decoupled from presentation: the old design awaited rAF for
@@ -1217,7 +1228,7 @@ export class WasmHlsPlayer {
             const sourceFps = estimatedFrameMs > 0 ? 1000 / estimatedFrameMs : 0;
 
             emitStatus({
-              message: `WASM beta · ${queued.frame.width}×${queued.frame.height} · ${displayFps.toFixed(1)} display fps · ${sourceFps.toFixed(1)} source fps · ${rafFps.toFixed(1)} rAF fps · ${decodeFps.toFixed(1)} decode fps · ${droppedFrames} dropped · q${frameQueue.length} · live HLS · ${this.audio?.status ?? "video only"}`,
+              message: `WASM beta · ${queued.frame.width}×${queued.frame.height} · ${displayFps.toFixed(1)} display fps · ${sourceFps.toFixed(1)} source fps · ${rafFps.toFixed(1)} rAF fps · ${decodeFps.toFixed(1)} decode fps · ${droppedFrames} dropped · q${frameQueue.length} · AV ${avDriftMs >= 0 ? "+" : ""}${avDriftMs.toFixed(0)}ms · live HLS · ${this.audio?.status ?? "video only"}`,
               frames: presentedFrames,
               decodedFrames,
               droppedFrames,
@@ -1229,6 +1240,7 @@ export class WasmHlsPlayer {
               decodeFps,
               frameMs: estimatedFrameMs,
               queueDepth: frameQueue.length,
+              avDriftMs,
               deliveredSegments,
             });
           }
@@ -1256,7 +1268,7 @@ export class WasmHlsPlayer {
       }
       if (generation !== this.generation) break;
 
-      const [result, packets] = await libav.ff_read_frame_multi(formatContext, packet, { limit: 128 * 1024 });
+      const [result, packets] = await libav.ff_read_frame_multi(formatContext, packet, { limit: 32 * 1024 });
       if (generation !== this.generation) break;
 
       if (audioStream && audioIndex >= 0 && this.audio) {
@@ -1305,6 +1317,26 @@ export class WasmHlsPlayer {
           }
 
           fallbackTargetWallMs = baseWallMs + (mediaSeconds - baseMediaSeconds) * 1000;
+
+          // Preserve the source PTS cadence (e.g. 30 fps) and use audio only
+          // as a phase reference. Driving every video frame directly from the
+          // audio target was measurably slowing 30 fps feeds to ~25 fps on the
+          // Tesla. Small periodic corrections keep A/V sync without changing
+          // the video's nominal frame rate.
+          const audioTarget = this.audio?.targetWallMs(mediaSeconds) ?? null;
+          if (audioTarget !== null) {
+            avDriftMs = audioTarget - fallbackTargetWallMs;
+            if (Math.abs(avDriftMs) > 250) {
+              baseWallMs += avDriftMs;
+              fallbackTargetWallMs += avDriftMs;
+              lastAvCorrectionAt = now;
+            } else if (now - lastAvCorrectionAt >= 1000) {
+              const correction = Math.max(-8, Math.min(8, avDriftMs));
+              baseWallMs += correction;
+              fallbackTargetWallMs += correction;
+              lastAvCorrectionAt = now;
+            }
+          }
 
           if (fallbackTargetWallMs < now - 1500 || fallbackTargetWallMs > now + 3000) {
             baseMediaSeconds = mediaSeconds;
