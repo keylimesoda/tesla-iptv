@@ -1331,6 +1331,5 @@ export class WasmHlsPlayer {
         break;
       }
     }
-    }
   }
 }
