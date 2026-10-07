@@ -1073,6 +1073,18 @@ export class WasmHlsPlayer {
     let estimatedFrameMs = 1000 / 30;
     let fallbackNextWallMs = performance.now();
     const presentationTimes: number[] = [];
+    const rafTimes: number[] = [];
+
+    // Measure the browser's actual animation cadence independently of our video
+    // scheduler. This tells us whether a low display FPS is caused by pacing or
+    // by the Tesla Chromium compositor/main thread itself.
+    const sampleRaf = (timestamp: number): void => {
+      if (generation !== this.generation) return;
+      rafTimes.push(timestamp);
+      while (rafTimes.length > 2 && rafTimes[0] < timestamp - 5000) rafTimes.shift();
+      requestAnimationFrame(sampleRaf);
+    };
+    requestAnimationFrame(sampleRaf);
 
     emitStatus({
       message: `WASM beta: decoding H.264 · worker + paced WebGL · ${this.audio?.status ?? "video only"} · ${snapshot.segmentCount}-segment startup buffer${snapshot.seconds ? ` / ~${snapshot.seconds.toFixed(1)}s` : ""}`,
@@ -1185,14 +1197,17 @@ export class WasmHlsPlayer {
             : 0;
           const displayFps = windowMs > 0 ? (presentationTimes.length - 1) * 1000 / windowMs : 0;
           const decodeFps = decodeMs > 0 ? decodedFrames / (decodeMs / 1000) : 0;
+          const rafWindowMs = rafTimes.length > 1 ? rafTimes[rafTimes.length - 1] - rafTimes[0] : 0;
+          const rafFps = rafWindowMs > 0 ? (rafTimes.length - 1) * 1000 / rafWindowMs : 0;
           emitStatus({
-            message: `WASM beta · ${decoded.width}×${decoded.height} · ${displayFps.toFixed(1)} display fps · ${decodeFps.toFixed(1)} decode fps · ${droppedFrames} dropped · live HLS · ${this.audio?.status ?? "video only"}`,
+            message: `WASM beta · ${decoded.width}×${decoded.height} · ${displayFps.toFixed(1)} display fps · ${rafFps.toFixed(1)} rAF fps · ${decodeFps.toFixed(1)} decode fps · ${droppedFrames} dropped · live HLS · ${this.audio?.status ?? "video only"}`,
             frames: presentedFrames,
             decodedFrames,
             droppedFrames,
             width: decoded.width,
             height: decoded.height,
             displayFps,
+            rafFps,
             decodeFps,
             frameMs: estimatedFrameMs,
             deliveredSegments,
