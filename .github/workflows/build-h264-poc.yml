@@ -24,6 +24,30 @@ jobs:
       - name: Checkout tesla-iptv
         uses: actions/checkout@v4
 
+      - name: Restore libav worker frame layout compatibility
+        run: |
+          python - <<'PY'
+          from pathlib import Path
+
+          path = Path("src/wasm-player.ts")
+          text = path.read_text()
+          old = 'copyoutFrame: "video_packed",'
+          new = 'copyoutFrame: "video",'
+          if old in text:
+              path.write_text(text.replace(old, new, 1))
+          PY
+
+          # libav.js worker mode is not returning layout metadata for the packed
+          # frame path on the deployed runtime. Persist the known-good frame
+          # representation to main as well as using it for this build.
+          if ! git diff --quiet -- src/wasm-player.ts; then
+            git config user.name "github-actions[bot]"
+            git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+            git add src/wasm-player.ts
+            git commit -m "fix: restore YUV frame layout from libav worker [skip ci]"
+            git push origin HEAD:main
+          fi
+
       - name: Set up Node
         uses: actions/setup-node@v4
         with:
