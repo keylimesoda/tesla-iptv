@@ -154,13 +154,15 @@ function setWasmUi(enabled: boolean): void {
   els.wasmCanvas.classList.toggle("active", enabled);
   els.stage.classList.toggle("wasm-active", enabled);
   els.canvasMode.disabled = enabled;
-  els.mute.disabled = enabled;
+  els.mute.disabled = false;
 }
 
 function startWasm(ch: Channel): void {
+  wasmPlayer.setMuted(player.muted);
   player.stop();
   setWasmUi(true);
   els.channelSub.textContent = "WASM beta · starting…";
+  updateMuteUI();
   void wasmPlayer.load(ch.url).catch((err) => {
     if (!wasmActive) return;
     const msg = err instanceof Error ? err.message : String(err);
@@ -215,7 +217,8 @@ function updatePlayUI(): void {
 }
 
 function updateMuteUI(): void {
-  els.muteWaves.style.opacity = player.muted ? "0" : "1";
+  const muted = wasmActive ? wasmPlayer.muted : player.muted;
+  els.muteWaves.style.opacity = muted ? "0" : "1";
 }
 
 // --- wiring ---
@@ -255,8 +258,8 @@ els.wasmMode.addEventListener("change", () => {
 });
 
 els.mute.addEventListener("click", () => {
-  if (wasmActive) return;
-  player.setMuted(!player.muted);
+  if (wasmActive) wasmPlayer.setMuted(!wasmPlayer.muted);
+  else player.setMuted(!player.muted);
   updateMuteUI();
 });
 
