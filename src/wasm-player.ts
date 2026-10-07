@@ -385,6 +385,20 @@ class NativeAacAudio {
   private baseMediaSeconds: number | null = null;
   private baseContextTime = 0;
   private scheduledUntil = 0;
+
+  // AudioDecoder typically emits one 1024-sample AAC frame at a time (~47/s
+  // at 48 kHz). Creating an AudioBuffer + AudioBufferSourceNode for every one
+  // of those callbacks is surprisingly expensive on Tesla Chromium, so batch
+  // several decoded frames before touching the Web Audio graph.
+  private pendingAudio: {
+    sampleRate: number;
+    channels: number;
+    startMediaSeconds: number;
+    frames: number;
+    planes: Float32Array[][];
+  } | null = null;
+  private readonly audioBatchFrames = 4096;
+
   private _status = "audio probe";
   private _muted = false;
 
@@ -446,6 +460,7 @@ class NativeAacAudio {
   disable(reason: string): void {
     this._status = reason;
     this.configured = false;
+    this.pendingAudio = null;
     if (this.decoder) {
       try {
         this.decoder.close();
@@ -590,8 +605,7 @@ class NativeAacAudio {
 
   private handleOutput(audioData: any): void {
     const context = this.context;
-    const gain = this.gain;
-    if (!context || !gain) {
+    if (!context || !this.gain) {
       audioData.close?.();
       return;
     }
@@ -600,42 +614,103 @@ class NativeAacAudio {
       const channels = audioData.numberOfChannels;
       const frames = audioData.numberOfFrames;
       const sampleRate = audioData.sampleRate;
-      const buffer = context.createBuffer(channels, frames, sampleRate);
+      const mediaSeconds = audioData.timestamp / 1_000_000;
+
+      const expectedNext = this.pendingAudio
+        ? this.pendingAudio.startMediaSeconds + this.pendingAudio.frames / this.pendingAudio.sampleRate
+        : mediaSeconds;
+
+      if (
+        this.pendingAudio &&
+        (
+          this.pendingAudio.sampleRate !== sampleRate ||
+          this.pendingAudio.channels !== channels ||
+          Math.abs(mediaSeconds - expectedNext) > 0.050
+        )
+      ) {
+        this.flushAudioBatch();
+      }
+
+      if (!this.pendingAudio) {
+        this.pendingAudio = {
+          sampleRate,
+          channels,
+          startMediaSeconds: mediaSeconds,
+          frames: 0,
+          planes: Array.from({ length: channels }, () => []),
+        };
+      }
 
       for (let channel = 0; channel < channels; channel++) {
-        audioData.copyTo(buffer.getChannelData(channel), {
+        const plane = new Float32Array(frames);
+        audioData.copyTo(plane, {
           planeIndex: channel,
           format: "f32-planar",
         });
+        this.pendingAudio.planes[channel].push(plane);
+      }
+      this.pendingAudio.frames += frames;
+
+      if (this.pendingAudio.frames >= this.audioBatchFrames) {
+        this.flushAudioBatch();
+      }
+    } catch (error) {
+      this._status = `native audio output failed: ${error instanceof Error ? error.message : String(error)}`;
+    } finally {
+      audioData.close?.();
+    }
+  }
+
+  private flushAudioBatch(): void {
+    const pending = this.pendingAudio;
+    const context = this.context;
+    const gain = this.gain;
+    if (!pending || !context || !gain || !pending.frames) return;
+    this.pendingAudio = null;
+
+    try {
+      const buffer = context.createBuffer(pending.channels, pending.frames, pending.sampleRate);
+
+      for (let channel = 0; channel < pending.channels; channel++) {
+        const destination = buffer.getChannelData(channel);
+        let offset = 0;
+        for (const plane of pending.planes[channel]) {
+          destination.set(plane, offset);
+          offset += plane.length;
+        }
       }
 
-      const mediaSeconds = audioData.timestamp / 1_000_000;
+      const mediaSeconds = pending.startMediaSeconds;
       const lead = 0.12;
 
       if (this.baseMediaSeconds === null) {
         this.baseMediaSeconds = mediaSeconds;
         this.baseContextTime = context.currentTime + lead;
+        this.scheduledUntil = this.baseContextTime;
       }
 
       let startAt = this.baseContextTime + (mediaSeconds - this.baseMediaSeconds);
 
-      // Recover from a discontinuity or an underrun by establishing a fresh
-      // audio/media clock mapping instead of trying to play old samples late.
-      if (startAt < context.currentTime - 0.10 || startAt > context.currentTime + 8) {
+      // Recover from discontinuities/underruns by establishing a fresh
+      // audio/media mapping instead of creating a growing sync error.
+      if (startAt < context.currentTime - 0.05 || startAt > context.currentTime + 8) {
         this.baseMediaSeconds = mediaSeconds;
         this.baseContextTime = context.currentTime + lead;
+        this.scheduledUntil = this.baseContextTime;
         startAt = this.baseContextTime;
       }
+
+      // Avoid tiny scheduling gaps between batches without allowing the audio
+      // graph to pull the media clock forward.
+      startAt = Math.max(startAt, this.scheduledUntil, context.currentTime + 0.005);
 
       const source = context.createBufferSource();
       source.buffer = buffer;
       source.connect(gain);
-      source.start(Math.max(startAt, context.currentTime + 0.005));
-      this.scheduledUntil = Math.max(this.scheduledUntil, startAt + buffer.duration);
+      source.start(startAt);
+      this.scheduledUntil = startAt + buffer.duration;
     } catch (error) {
       this._status = `native audio output failed: ${error instanceof Error ? error.message : String(error)}`;
-    } finally {
-      audioData.close?.();
     }
   }
 
@@ -668,7 +743,9 @@ class NativeAacAudio {
       this.context = null;
     }
     this.gain = null;
+    this.pendingAudio = null;
     this.baseMediaSeconds = null;
+    this.scheduledUntil = 0;
     this.nextInputTimestampUs = null;
     this.configured = false;
   }
