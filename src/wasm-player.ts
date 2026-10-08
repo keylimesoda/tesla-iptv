@@ -1161,9 +1161,11 @@ export class WasmHlsPlayer {
     let decodeMs = 0;
     let lastMediaSeconds: number | null = null;
     let estimatedFrameMs = 1000 / 30;
-    let nextPresentationWallMs: number | null = null;
     let avDriftMs = 0;
     let lastStatusAt = 0;
+    let lastRafTimestamp: number | null = null;
+    let cadenceBudgetMs = 0;
+    let renderMsEma = 0;
 
     type QueuedVideoFrame = {
       frame: any;
@@ -1174,47 +1176,75 @@ export class WasmHlsPlayer {
     const presentationTimes: number[] = [];
     const rafTimes: number[] = [];
 
-    // Cadence-first presenter: source PTS determines the frame interval, while
-    // audio is used only for phase correction/catch-up. This makes 30 fps mean
-    // one frame every ~33.3 ms regardless of demux/decode burst shape.
+    // rAF-budget presenter. The browser gives us a stable 60 Hz callback in the
+    // Tesla, and the decoder tells us the source cadence. Accumulate real rAF
+    // time and consume exactly one source-frame interval per presentation.
+    // This avoids depending on absolute PTS/audio wall-clock mapping for cadence.
     const present = (timestamp: number): void => {
       if (generation !== this.generation) return;
 
       rafTimes.push(timestamp);
       while (rafTimes.length > 2 && rafTimes[0] < timestamp - 5000) rafTimes.shift();
 
-      if (!this.isPaused && frameQueue.length) {
+      if (lastRafTimestamp === null) lastRafTimestamp = timestamp;
+      const rafDelta = Math.max(0, Math.min(100, timestamp - lastRafTimestamp));
+      lastRafTimestamp = timestamp;
+
+      if (this.isPaused) {
+        cadenceBudgetMs = 0;
+      } else {
+        cadenceBudgetMs = Math.min(
+          cadenceBudgetMs + rafDelta,
+          Math.max(estimatedFrameMs * 2, 40),
+        );
+      }
+
+      if (!this.isPaused && frameQueue.length && cadenceBudgetMs + 0.5 >= estimatedFrameMs) {
         const now = performance.now();
 
-        if (nextPresentationWallMs === null) {
-          const first = frameQueue[0];
-          const audioTarget = first.mediaSeconds !== null
-            ? this.audio?.targetWallMs(first.mediaSeconds) ?? null
-            : null;
-          nextPresentationWallMs = audioTarget !== null
-            ? Math.max(now, audioTarget)
-            : now;
+        // Keep cadence independent of audio. Audio only tells us when video has
+        // drifted far enough to justify a discrete drop/hold correction.
+        const headMediaSeconds = frameQueue[0].mediaSeconds;
+        const headAudioTarget = headMediaSeconds !== null
+          ? this.audio?.targetWallMs(headMediaSeconds) ?? null
+          : null;
+
+        let holdForAudio = false;
+        if (headAudioTarget !== null) {
+          avDriftMs = headAudioTarget - now;
+
+          if (avDriftMs < -100 && frameQueue.length > 1) {
+            let stale = 0;
+            while (stale < frameQueue.length - 1) {
+              const mediaSeconds = frameQueue[stale].mediaSeconds;
+              if (mediaSeconds === null) break;
+              const target = this.audio?.targetWallMs(mediaSeconds) ?? null;
+              if (target === null || target >= now - 60) break;
+              stale++;
+            }
+            if (stale > 0) {
+              frameQueue.splice(0, stale);
+              droppedFrames += stale;
+            }
+          } else if (avDriftMs > 100) {
+            // Video is materially ahead of audio: hold a compositor tick rather
+            // than changing the nominal source frame interval.
+            holdForAudio = true;
+            cadenceBudgetMs = Math.min(cadenceBudgetMs, estimatedFrameMs);
+          }
         }
 
-        if (now + 4 >= nextPresentationWallMs) {
-          let chosenIndex = 0;
+        if (!holdForAudio && frameQueue.length) {
+          const queued = frameQueue.shift()!;
+          cadenceBudgetMs = Math.max(0, cadenceBudgetMs - estimatedFrameMs);
 
-          // Audio is a sync reference, not the cadence clock. If the queue head
-          // is materially late relative to audio, discard only enough stale
-          // frames to get back near the audio playhead.
-          for (let i = 0; i < frameQueue.length - 1; i++) {
-            const mediaSeconds = frameQueue[i].mediaSeconds;
-            if (mediaSeconds === null) break;
-            const audioTarget = this.audio?.targetWallMs(mediaSeconds) ?? null;
-            if (audioTarget === null || audioTarget >= now - Math.max(80, estimatedFrameMs * 2)) break;
-            chosenIndex = i + 1;
-          }
-
-          if (chosenIndex > 0) droppedFrames += chosenIndex;
-          const queued = frameQueue[chosenIndex];
-          frameQueue.splice(0, chosenIndex + 1);
-
+          const renderStart = performance.now();
           this.renderer!.render(queued.frame);
+          const renderMs = performance.now() - renderStart;
+          renderMsEma = renderMsEma
+            ? renderMsEma * 0.9 + renderMs * 0.1
+            : renderMs;
+
           presentedFrames++;
 
           const presentedAt = performance.now();
@@ -1223,34 +1253,9 @@ export class WasmHlsPlayer {
             presentationTimes.shift();
           }
 
-          // Advance by the source cadence. Use adjacent PTS when available;
-          // otherwise fall back to the rolling estimate.
-          let intervalMs = estimatedFrameMs;
-          if (queued.mediaSeconds !== null && frameQueue.length && frameQueue[0].mediaSeconds !== null) {
-            const ptsDeltaMs = (frameQueue[0].mediaSeconds! - queued.mediaSeconds) * 1000;
-            if (ptsDeltaMs >= 4 && ptsDeltaMs <= 250) intervalMs = ptsDeltaMs;
-          }
-          nextPresentationWallMs += intervalMs;
-
-          // Phase-lock gently to audio without stretching video cadence. Large
-          // discontinuities re-anchor immediately; normal drift gets <=1 ms of
-          // correction per rendered frame.
           if (queued.mediaSeconds !== null) {
-            const audioTarget = this.audio?.targetWallMs(queued.mediaSeconds) ?? null;
-            if (audioTarget !== null) {
-              avDriftMs = audioTarget - presentedAt;
-              if (Math.abs(avDriftMs) > 250) {
-                nextPresentationWallMs += avDriftMs;
-              } else {
-                nextPresentationWallMs += Math.max(-1, Math.min(1, avDriftMs * 0.05));
-              }
-            }
-          }
-
-          // If the main thread ever stalls badly, recover rather than running a
-          // long burst of old frames.
-          if (nextPresentationWallMs < presentedAt - intervalMs * 2) {
-            nextPresentationWallMs = presentedAt + intervalMs;
+            const target = this.audio?.targetWallMs(queued.mediaSeconds) ?? null;
+            if (target !== null) avDriftMs = target - presentedAt;
           }
 
           if (presentedFrames === 1 || presentedAt - lastStatusAt >= 1000) {
@@ -1265,7 +1270,7 @@ export class WasmHlsPlayer {
             const sourceFps = estimatedFrameMs > 0 ? 1000 / estimatedFrameMs : 0;
 
             emitStatus({
-              message: `WASM beta · ${queued.frame.width}×${queued.frame.height} · ${displayFps.toFixed(1)} display fps · ${sourceFps.toFixed(1)} source fps · ${rafFps.toFixed(1)} rAF fps · ${decodeFps.toFixed(1)} decode fps · ${droppedFrames} dropped · q${frameQueue.length} · AV ${avDriftMs >= 0 ? "+" : ""}${avDriftMs.toFixed(0)}ms · live HLS · ${this.audio?.status ?? "video only"}`,
+              message: `WASM beta · ${queued.frame.width}×${queued.frame.height} · ${displayFps.toFixed(1)} display fps · ${sourceFps.toFixed(1)} source fps · ${rafFps.toFixed(1)} rAF fps · ${decodeFps.toFixed(1)} decode fps · render ${renderMsEma.toFixed(1)}ms · ${droppedFrames} dropped · q${frameQueue.length} · AV ${avDriftMs >= 0 ? "+" : ""}${avDriftMs.toFixed(0)}ms · live HLS · ${this.audio?.status ?? "video only"}`,
               frames: presentedFrames,
               decodedFrames,
               droppedFrames,
@@ -1275,6 +1280,7 @@ export class WasmHlsPlayer {
               sourceFps,
               rafFps,
               decodeFps,
+              renderMs: renderMsEma,
               frameMs: estimatedFrameMs,
               queueDepth: frameQueue.length,
               avDriftMs,
@@ -1289,7 +1295,7 @@ export class WasmHlsPlayer {
     requestAnimationFrame(present);
 
     emitStatus({
-      message: `WASM beta: decoding H.264 · cadence-first rAF queue · ${this.audio?.status ?? "video only"} · ${snapshot.segmentCount}-segment startup buffer${snapshot.seconds ? ` / ~${snapshot.seconds.toFixed(1)}s` : ""}`,
+      message: `WASM beta: decoding H.264 · rAF budget queue · ${this.audio?.status ?? "video only"} · ${snapshot.segmentCount}-segment startup buffer${snapshot.seconds ? ` / ~${snapshot.seconds.toFixed(1)}s` : ""}`,
       width: stream.codecpar?.width,
       height: stream.codecpar?.height,
     });
