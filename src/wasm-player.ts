@@ -618,6 +618,23 @@ class NativeAacAudio {
     }
   }
 
+  setMasterClock(mediaSeconds: number, wallMs: number): void {
+    const context = this.context;
+    if (!context || !Number.isFinite(mediaSeconds) || !Number.isFinite(wallMs)) return;
+
+    // Video owns cadence. Convert its media-time/wall-time anchor into the
+    // AudioContext clock domain and schedule AAC strictly against that mapping.
+    // This prevents Web Audio buffering/underrun recovery from accumulating a
+    // persistent A/V offset.
+    this.baseMediaSeconds = mediaSeconds;
+    this.baseContextTime = context.currentTime + (wallMs - performance.now()) / 1000;
+    this.scheduledUntil = this.baseContextTime;
+
+    // AAC may have decoded slightly before the first video frame established
+    // the shared clock. Flush that buffered PCM now that we know where it belongs.
+    if (this.pendingAudio?.frames) this.flushAudioBatch();
+  }
+
   private handleOutput(audioData: any): void {
     const context = this.context;
     if (!context || !this.gain) {
@@ -695,35 +712,32 @@ class NativeAacAudio {
         }
       }
 
-      const mediaSeconds = pending.startMediaSeconds;
-      const lead = 0.12;
-
+      // Do not schedule audio until video establishes the shared media clock.
+      // Decoded PCM can safely accumulate for this very short startup window.
       if (this.baseMediaSeconds === null) {
-        this.baseMediaSeconds = mediaSeconds;
-        this.baseContextTime = context.currentTime + lead;
-        this.scheduledUntil = this.baseContextTime;
+        this.pendingAudio = pending;
+        return;
       }
 
+      const mediaSeconds = pending.startMediaSeconds;
       let startAt = this.baseContextTime + (mediaSeconds - this.baseMediaSeconds);
+      const earliest = context.currentTime + 0.005;
+      let offsetSeconds = 0;
 
-      // Recover from discontinuities/underruns by establishing a fresh
-      // audio/media mapping instead of creating a growing sync error.
-      if (startAt < context.currentTime - 0.05 || startAt > context.currentTime + 8) {
-        this.baseMediaSeconds = mediaSeconds;
-        this.baseContextTime = context.currentTime + lead;
-        this.scheduledUntil = this.baseContextTime;
-        startAt = this.baseContextTime;
+      // If decoding/demux delivered this batch late, trim the stale beginning
+      // rather than pushing the whole batch later. Pushing late audio was the
+      // source of the stable ~1.5 s sync error.
+      if (startAt < earliest) {
+        offsetSeconds = earliest - startAt;
+        if (offsetSeconds >= buffer.duration) return;
+        startAt = earliest;
       }
-
-      // Avoid tiny scheduling gaps between batches without allowing the audio
-      // graph to pull the media clock forward.
-      startAt = Math.max(startAt, this.scheduledUntil, context.currentTime + 0.005);
 
       const source = context.createBufferSource();
       source.buffer = buffer;
       source.connect(gain);
-      source.start(startAt);
-      this.scheduledUntil = startAt + buffer.duration;
+      source.start(startAt, offsetSeconds);
+      this.scheduledUntil = Math.max(this.scheduledUntil, startAt + buffer.duration - offsetSeconds);
     } catch (error) {
       this._status = `native audio output failed: ${error instanceof Error ? error.message : String(error)}`;
     }
@@ -1166,8 +1180,7 @@ export class WasmHlsPlayer {
     let lastRafTimestamp: number | null = null;
     let cadenceBudgetMs = 0;
     let renderMsEma = 0;
-    let syncState: "waiting" | "armed" | "running" = audioStream ? "waiting" : "running";
-    let syncWaitStartedAt = performance.now();
+    let syncState: "waiting" | "armed" | "running" = "waiting";
     let videoStartWallMs: number | null = null;
     let initialSyncMs = 0;
     let startupSkipped = 0;
@@ -1196,44 +1209,21 @@ export class WasmHlsPlayer {
       lastRafTimestamp = timestamp;
       const now = performance.now();
 
-      // Establish A/V phase exactly once at startup. Crucially, keep demuxing
-      // until the native audio clock actually exists; the old 24-frame queue
-      // backpressure could stop demux before enough AAC had arrived to start
-      // Web Audio, so video timed out and began ~1.5 s before audio.
+      // Establish one shared A/V clock from the first decoded video PTS.
+      // Give Web Audio a short scheduling lead, then run video independently at
+      // source cadence. Audio schedules itself to this same anchor.
       if (!this.isPaused && frameQueue.length && syncState === "waiting") {
-        let alignedIndex = -1;
-        let alignedTarget: number | null = null;
-
-        // Once AudioContext has a media-time mapping, discard only pre-roll
-        // video frames whose matching audio time has already passed. Start on
-        // the first frame at/just ahead of the audio playhead.
-        for (let i = 0; i < frameQueue.length; i++) {
-          const mediaSeconds = frameQueue[i].mediaSeconds;
-          if (mediaSeconds === null) continue;
-          const target = this.audio?.targetWallMs(mediaSeconds) ?? null;
-          if (target === null) break;
-
-          alignedIndex = i;
-          alignedTarget = target;
-          if (target >= now + 15) break;
-        }
-
-        if (alignedIndex >= 0 && alignedTarget !== null) {
-          if (alignedIndex > 0) {
-            frameQueue.splice(0, alignedIndex);
-            startupSkipped += alignedIndex;
-          }
-
-          avDriftMs = alignedTarget - now;
-          initialSyncMs = avDriftMs;
-          videoStartWallMs = Math.max(now, alignedTarget);
+        const headMediaSeconds = frameQueue[0].mediaSeconds;
+        if (headMediaSeconds !== null) {
+          const leadMs = 150;
+          videoStartWallMs = now + leadMs;
+          initialSyncMs = leadMs;
+          this.audio?.setMasterClock(headMediaSeconds, videoStartWallMs);
           syncState = "armed";
           cadenceBudgetMs = 0;
-        } else if (now - syncWaitStartedAt > 5000) {
-          // Audio may be unsupported/broken on an otherwise valid video feed.
-          // After a generous pre-roll, keep video usable rather than hanging.
-          syncState = "running";
-          cadenceBudgetMs = estimatedFrameMs;
+        } else {
+          videoStartWallMs = now;
+          syncState = "armed";
         }
       }
 
@@ -1323,7 +1313,7 @@ export class WasmHlsPlayer {
     requestAnimationFrame(present);
 
     emitStatus({
-      message: `WASM beta: decoding H.264 · audio-phased source-cadence rAF queue · ${this.audio?.status ?? "video only"} · ${snapshot.segmentCount}-segment startup buffer${snapshot.seconds ? ` / ~${snapshot.seconds.toFixed(1)}s` : ""}`,
+      message: `WASM beta: decoding H.264 · shared-clock source-cadence rAF queue · ${this.audio?.status ?? "video only"} · ${snapshot.segmentCount}-segment startup buffer${snapshot.seconds ? ` / ~${snapshot.seconds.toFixed(1)}s` : ""}`,
       width: stream.codecpar?.width,
       height: stream.codecpar?.height,
     });
@@ -1332,19 +1322,10 @@ export class WasmHlsPlayer {
       while (this.isPaused && generation === this.generation) await sleep(50);
       if (generation !== this.generation) break;
 
-      // Keep a modest decoded cushion during normal playback. While waiting for
-      // the native audio clock, NEVER stop demuxing on video queue depth: AAC
-      // may appear later in the interleaved stream. Instead retain only a rolling
-      // 24-frame video window so audio can continue arriving without unbounded
-      // raw-frame memory growth.
-      if (syncState === "waiting" && frameQueue.length > 24) {
-        const trim = frameQueue.length - 24;
-        frameQueue.splice(0, trim);
-        startupSkipped += trim;
-      } else {
-        while (frameQueue.length >= 24 && generation === this.generation && !this.isPaused) {
-          await sleep(5);
-        }
+      // Keep a modest decoded cushion without allowing multi-second raw-frame
+      // backlogs. Audio no longer needs demux to run ahead to establish its clock.
+      while (frameQueue.length >= 24 && generation === this.generation && !this.isPaused) {
+        await sleep(5);
       }
       if (generation !== this.generation) break;
 
