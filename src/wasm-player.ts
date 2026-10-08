@@ -400,6 +400,43 @@ class NativeAacAudio {
   private baseMediaSeconds: number | null = null;
   private baseContextTime = 0;
   private scheduledUntil = 0;
+  private discardedAudioSeconds = 0;
+  private scheduledAudioSeconds = 0;
+  private scheduledAudioBatches = 0;
+  private discardedAudioBatches = 0;
+
+  get bufferedAheadSeconds(): number {
+    return this.context && this.baseMediaSeconds !== null
+      ? Math.max(0, this.scheduledUntil - this.context.currentTime)
+      : 0;
+  }
+
+  get audioStats(): { aheadMs: number; discardedMs: number; batches: number; missed: number; pendingMs: number; decoderQueue: number } {
+    const pending = this.pendingAudio;
+    return {
+      aheadMs: Math.round(this.bufferedAheadSeconds * 1000),
+      discardedMs: Math.round(this.discardedAudioSeconds * 1000),
+      batches: this.scheduledAudioBatches,
+      missed: this.discardedAudioBatches,
+      pendingMs: pending ? Math.round(pending.frames / pending.sampleRate * 1000) : 0,
+      decoderQueue: Number(this.decoder?.decodeQueueSize || 0),
+    };
+  }
+
+  // The initial video clock must not start until decoded AAC actually covers
+  // the next several video frames. Otherwise fixed-clock audio is already stale
+  // when demux (especially interleaved TS) finally provides those samples.
+  readyForVideo(mediaSeconds: number, aheadSeconds: number): boolean {
+    if (!this.context || !this.configured || !this.decoder) {
+      return !this.context || this._status.includes("failed") ||
+        this._status.includes("unsupported") || this._status.includes("unavailable");
+    }
+    const pending = this.pendingAudio;
+    if (!pending || !pending.frames || !Number.isFinite(mediaSeconds)) return false;
+    const first = pending.startMediaSeconds;
+    const end = first + pending.frames / pending.sampleRate;
+    return first <= mediaSeconds + 0.20 && end >= mediaSeconds + aheadSeconds;
+  }
 
   // AudioDecoder typically emits one 1024-sample AAC frame at a time (~47/s
   // at 48 kHz). Creating an AudioBuffer + AudioBufferSourceNode for every one
@@ -700,6 +737,13 @@ class NativeAacAudio {
     if (!pending || !context || !gain || !pending.frames) return;
     this.pendingAudio = null;
 
+    // Accumulate decoded PCM before video establishes the shared clock.
+    // Do not make and discard AudioBuffers while waiting for preroll.
+    if (this.baseMediaSeconds === null) {
+      this.pendingAudio = pending;
+      return;
+    }
+
     try {
       const buffer = context.createBuffer(pending.channels, pending.frames, pending.sampleRate);
 
@@ -712,13 +756,6 @@ class NativeAacAudio {
         }
       }
 
-      // Do not schedule audio until video establishes the shared media clock.
-      // Decoded PCM can safely accumulate for this very short startup window.
-      if (this.baseMediaSeconds === null) {
-        this.pendingAudio = pending;
-        return;
-      }
-
       const mediaSeconds = pending.startMediaSeconds;
       let startAt = this.baseContextTime + (mediaSeconds - this.baseMediaSeconds);
       const earliest = context.currentTime + 0.005;
@@ -729,6 +766,8 @@ class NativeAacAudio {
       // source of the stable ~1.5 s sync error.
       if (startAt < earliest) {
         offsetSeconds = earliest - startAt;
+        this.discardedAudioSeconds += Math.min(offsetSeconds, buffer.duration);
+        this.discardedAudioBatches++;
         if (offsetSeconds >= buffer.duration) return;
         startAt = earliest;
       }
@@ -737,6 +776,8 @@ class NativeAacAudio {
       source.buffer = buffer;
       source.connect(gain);
       source.start(startAt, offsetSeconds);
+      this.scheduledAudioBatches++;
+      this.scheduledAudioSeconds += buffer.duration - offsetSeconds;
       this.scheduledUntil = Math.max(this.scheduledUntil, startAt + buffer.duration - offsetSeconds);
     } catch (error) {
       this._status = `native audio output failed: ${error instanceof Error ? error.message : String(error)}`;
@@ -775,6 +816,10 @@ class NativeAacAudio {
     this.pendingAudio = null;
     this.baseMediaSeconds = null;
     this.scheduledUntil = 0;
+    this.discardedAudioSeconds = 0;
+    this.scheduledAudioSeconds = 0;
+    this.scheduledAudioBatches = 0;
+    this.discardedAudioBatches = 0;
     this.nextInputTimestampUs = null;
     this.configured = false;
   }
@@ -1184,6 +1229,7 @@ export class WasmHlsPlayer {
     let videoStartWallMs: number | null = null;
     let initialSyncMs = 0;
     let startupSkipped = 0;
+    let syncWaitStartedAt: number | null = null;
 
     type QueuedVideoFrame = {
       frame: any;
@@ -1191,6 +1237,12 @@ export class WasmHlsPlayer {
     };
 
     const frameQueue: QueuedVideoFrame[] = [];
+    // Keep compressed H.264 packets separate from the decoded-frame queue.
+    // Demux must be free to supply AAC even while video is buffered ahead.
+    const compressedVideoQueue: any[] = [];
+    let compressedVideoBytes = 0;
+    let demuxEof = false;
+    let decoderFlushed = false;
     const presentationTimes: number[] = [];
     const rafTimes: number[] = [];
 
@@ -1209,21 +1261,24 @@ export class WasmHlsPlayer {
       lastRafTimestamp = timestamp;
       const now = performance.now();
 
-      // Establish one shared A/V clock from the first decoded video PTS.
-      // Give Web Audio a short scheduling lead, then run video independently at
-      // source cadence. Audio schedules itself to this same anchor.
+      // Video remains the cadence master. Delay initial startup until WebCodecs
+      // has delivered enough decoded AAC to cover the video head (or until a
+      // bounded timeout for an unusable/missing audio track). This preroll is
+      // separate from the source-driven 30fps presentation loop below.
       if (!this.isPaused && frameQueue.length && syncState === "waiting") {
+        if (syncWaitStartedAt === null) syncWaitStartedAt = now;
         const headMediaSeconds = frameQueue[0].mediaSeconds;
-        if (headMediaSeconds !== null) {
-          const leadMs = 150;
+        const audioReady = !audioStream ||
+          (headMediaSeconds !== null && this.audio?.readyForVideo(headMediaSeconds, 0.45));
+        const timedOut = now - syncWaitStartedAt >= 3500;
+
+        if (audioReady || timedOut) {
+          const leadMs = audioReady && audioStream ? 250 : 50;
           videoStartWallMs = now + leadMs;
           initialSyncMs = leadMs;
-          this.audio?.setMasterClock(headMediaSeconds, videoStartWallMs);
+          if (headMediaSeconds !== null) this.audio?.setMasterClock(headMediaSeconds, videoStartWallMs);
           syncState = "armed";
           cadenceBudgetMs = 0;
-        } else {
-          videoStartWallMs = now;
-          syncState = "armed";
         }
       }
 
@@ -1285,9 +1340,10 @@ export class WasmHlsPlayer {
             const rafWindowMs = rafTimes.length > 1 ? rafTimes[rafTimes.length - 1] - rafTimes[0] : 0;
             const rafFps = rafWindowMs > 0 ? (rafTimes.length - 1) * 1000 / rafWindowMs : 0;
             const sourceFps = estimatedFrameMs > 0 ? 1000 / estimatedFrameMs : 0;
+            const a = this.audio?.audioStats;
 
             emitStatus({
-              message: `WASM beta · ${queued.frame.width}×${queued.frame.height} · ${displayFps.toFixed(1)} display fps · ${sourceFps.toFixed(1)} source fps · ${rafFps.toFixed(1)} rAF fps · ${decodeFps.toFixed(1)} decode fps · render ${renderMsEma.toFixed(1)}ms · ${droppedFrames} dropped · q${frameQueue.length} · pre ${startupSkipped} · AV ${avDriftMs >= 0 ? "+" : ""}${avDriftMs.toFixed(0)}ms · init ${initialSyncMs >= 0 ? "+" : ""}${initialSyncMs.toFixed(0)}ms · live HLS · ${this.audio?.status ?? "video only"}`,
+              message: `WASM beta · ${queued.frame.width}×${queued.frame.height} · ${displayFps.toFixed(1)} display fps · ${sourceFps.toFixed(1)} source fps · ${rafFps.toFixed(1)} rAF fps · ${decodeFps.toFixed(1)} decode fps · render ${renderMsEma.toFixed(1)}ms · ${droppedFrames} dropped · q${frameQueue.length} · pre ${startupSkipped} · AV ${avDriftMs >= 0 ? "+" : ""}${avDriftMs.toFixed(0)}ms · init ${initialSyncMs >= 0 ? "+" : ""}${initialSyncMs.toFixed(0)}ms · audio ${a?.aheadMs ?? 0}ms ahead/${a?.discardedMs ?? 0}ms late · aq${a?.decoderQueue ?? 0} · vpk${compressedVideoQueue.length} · live HLS · ${this.audio?.status ?? "video only"}`,
               frames: presentedFrames,
               decodedFrames,
               droppedFrames,
@@ -1303,6 +1359,8 @@ export class WasmHlsPlayer {
               avDriftMs,
               initialSyncMs,
               startupSkipped,
+              audioStats: a,
+              compressedVideoPackets: compressedVideoQueue.length,
               deliveredSegments,
             });
           }
@@ -1318,40 +1376,10 @@ export class WasmHlsPlayer {
       height: stream.codecpar?.height,
     });
 
-    while (generation === this.generation) {
-      while (this.isPaused && generation === this.generation) await sleep(50);
-      if (generation !== this.generation) break;
-
-      // Keep a modest decoded cushion without allowing multi-second raw-frame
-      // backlogs. Audio no longer needs demux to run ahead to establish its clock.
-      while (frameQueue.length >= 24 && generation === this.generation && !this.isPaused) {
-        await sleep(5);
-      }
-      if (generation !== this.generation) break;
-
-      const [result, packets] = await libav.ff_read_frame_multi(formatContext, packet, { limit: 32 * 1024 });
-      if (generation !== this.generation) break;
-
-      if (audioStream && audioIndex >= 0 && this.audio) {
-        try {
-          await this.audio.pushPackets(packets[audioIndex] || [], audioStream, libav);
-        } catch (error) {
-          this.audio.disable(`native audio failed: ${error instanceof Error ? error.message : String(error)}`);
-        }
-      }
-
-      const videoPackets = packets[videoIndex] || [];
-      const decodeStart = performance.now();
-      const frames = await libav.ff_decode_multi(codecContext, packet, frame, videoPackets, {
-        fin: result === libav.AVERROR_EOF,
-        copyoutFrame: "video",
-      });
-      decodeMs += performance.now() - decodeStart;
+    const enqueueDecoded = (frames: any[]): void => {
       decodedFrames += frames.length;
-
       for (const decoded of frames) {
-        if (generation !== this.generation) break;
-
+        if (generation !== this.generation) return;
         const framePts = frameTimestamp(libav, decoded);
         const tbNum = decoded.time_base_num || stream.time_base_num;
         const tbDen = decoded.time_base_den || stream.time_base_den;
@@ -1368,15 +1396,81 @@ export class WasmHlsPlayer {
           }
           lastMediaSeconds = mediaSeconds;
         }
-
         frameQueue.push({ frame: decoded, mediaSeconds });
       }
+    };
 
-      if (result === libav.AVERROR_EOF) {
-        while (frameQueue.length && generation === this.generation) await sleep(20);
-        emitStatus({ message: "WASM beta: stream ended (HLS source reached EOF)" });
-        break;
+    while (generation === this.generation) {
+      while (this.isPaused && generation === this.generation) await sleep(50);
+      if (generation !== this.generation) break;
+
+      // Only decode the compressed packets needed to keep a small video
+      // presentation cushion. Critically, this no longer blocks DEMUX, which
+      // also delivers AAC. A full decoded-video queue is not an audio throttle.
+      if (compressedVideoQueue.length && frameQueue.length < 12) {
+        const batch = compressedVideoQueue.splice(0, 10);
+        for (const p of batch) compressedVideoBytes -= p.data?.byteLength || 0;
+        const decodeStart = performance.now();
+        const frames = await libav.ff_decode_multi(codecContext, packet, frame, batch, {
+          fin: false,
+          copyoutFrame: "video",
+        });
+        decodeMs += performance.now() - decodeStart;
+        enqueueDecoded(frames);
+        continue;
       }
+
+      if (demuxEof) {
+        if (!compressedVideoQueue.length && !decoderFlushed) {
+          decoderFlushed = true;
+          const decodeStart = performance.now();
+          const frames = await libav.ff_decode_multi(codecContext, packet, frame, [], {
+            fin: true,
+            copyoutFrame: "video",
+          });
+          decodeMs += performance.now() - decodeStart;
+          enqueueDecoded(frames);
+        }
+        if (!frameQueue.length && !compressedVideoQueue.length) {
+          emitStatus({ message: "WASM beta: stream ended (HLS source reached EOF)" });
+          break;
+        }
+        await sleep(10);
+        continue;
+      }
+
+      // Read ahead until AAC has at least 0.8s scheduled. HLS segments deliver
+      // interleaved video/audio in bursts, so decoding exactly one video queue
+      // worth of packets is not enough to keep audio fed. Compressed H.264 is
+      // cheap to queue; raw YUV420 is not. Bound the compressed queue to 12 MiB.
+      const audioAhead = this.audio?.bufferedAheadSeconds ?? 0;
+      const needsAudio = !!audioStream && syncState !== "waiting";
+      const shouldReadAhead = syncState === "waiting" || (needsAudio && audioAhead < 0.8);
+      const videoNeedsPackets = compressedVideoQueue.length < 10 && frameQueue.length < 18;
+
+      if (compressedVideoBytes >= 12 * 1024 * 1024 ||
+          (!shouldReadAhead && !videoNeedsPackets)) {
+        await sleep(10);
+        continue;
+      }
+
+      const [result, packets] = await libav.ff_read_frame_multi(formatContext, packet, { limit: 64 * 1024 });
+      if (generation !== this.generation) break;
+
+      if (audioStream && audioIndex >= 0 && this.audio) {
+        try {
+          await this.audio.pushPackets(packets[audioIndex] || [], audioStream, libav);
+        } catch (error) {
+          this.audio.disable(`native audio failed: ${error instanceof Error ? error.message : String(error)}`);
+        }
+      }
+
+      const videoPackets = packets[videoIndex] || [];
+      for (const p of videoPackets) {
+        compressedVideoQueue.push(p);
+        compressedVideoBytes += p.data?.byteLength || 0;
+      }
+      if (result === libav.AVERROR_EOF) demuxEof = true;
     }
   }
 }
