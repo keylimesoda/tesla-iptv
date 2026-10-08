@@ -1166,6 +1166,10 @@ export class WasmHlsPlayer {
     let lastRafTimestamp: number | null = null;
     let cadenceBudgetMs = 0;
     let renderMsEma = 0;
+    let syncState: "waiting" | "armed" | "running" = audioStream ? "waiting" : "running";
+    let syncWaitStartedAt = performance.now();
+    let videoStartWallMs: number | null = null;
+    let initialSyncMs = 0;
 
     type QueuedVideoFrame = {
       frame: any;
@@ -1189,24 +1193,57 @@ export class WasmHlsPlayer {
       if (lastRafTimestamp === null) lastRafTimestamp = timestamp;
       const rafDelta = Math.max(0, Math.min(100, timestamp - lastRafTimestamp));
       lastRafTimestamp = timestamp;
+      const now = performance.now();
+
+      // Establish A/V phase exactly once at startup. The previous attempts used
+      // audio as a per-frame gate, which destroyed cadence. Instead, wait until
+      // the audio timeline can tell us when the queue head should appear, hold
+      // video until that instant, then run video at the source cadence forever.
+      if (!this.isPaused && frameQueue.length && syncState === "waiting") {
+        const headMediaSeconds = frameQueue[0].mediaSeconds;
+        const audioTarget = headMediaSeconds !== null
+          ? this.audio?.targetWallMs(headMediaSeconds) ?? null
+          : null;
+
+        if (audioTarget !== null) {
+          avDriftMs = audioTarget - now;
+          initialSyncMs = avDriftMs;
+          videoStartWallMs = Math.max(now, audioTarget);
+          syncState = "armed";
+          cadenceBudgetMs = 0;
+        } else if (now - syncWaitStartedAt > 1200) {
+          // Never make video fail just because an audio clock cannot be
+          // established. Fall back to immediate source-cadence playback.
+          syncState = "running";
+          cadenceBudgetMs = estimatedFrameMs;
+        }
+      }
+
+      if (!this.isPaused && syncState === "armed" && videoStartWallMs !== null) {
+        if (now + 2 >= videoStartWallMs) {
+          syncState = "running";
+          cadenceBudgetMs = estimatedFrameMs;
+          lastRafTimestamp = timestamp;
+        }
+      }
 
       if (this.isPaused) {
         cadenceBudgetMs = 0;
-      } else {
+      } else if (syncState === "running") {
         cadenceBudgetMs = Math.min(
           cadenceBudgetMs + rafDelta,
           Math.max(estimatedFrameMs * 2, 40),
         );
       }
 
-      if (!this.isPaused && frameQueue.length && cadenceBudgetMs + 0.5 >= estimatedFrameMs) {
-        const now = performance.now();
-
-        // Do not let the audio clock gate presentation cadence. On the Tesla,
-        // that interaction was catastrophically under-presenting otherwise
-        // healthy 30 fps streams (4–7 fps with 60 Hz rAF and huge decode headroom).
-        // First prove/maintain source-rate video; audio drift is measured below
-        // and can be corrected with a very slow PLL once cadence is solid.
+      if (
+        !this.isPaused &&
+        syncState === "running" &&
+        frameQueue.length &&
+        cadenceBudgetMs + 0.5 >= estimatedFrameMs
+      ) {
+        // Audio no longer controls frame-by-frame cadence. It only establishes
+        // the initial phase above; source PTS/rAF determine ongoing 30 fps.
         const queued = frameQueue.shift()!;
         cadenceBudgetMs = Math.max(0, cadenceBudgetMs - estimatedFrameMs);
 
@@ -1242,7 +1279,7 @@ export class WasmHlsPlayer {
             const sourceFps = estimatedFrameMs > 0 ? 1000 / estimatedFrameMs : 0;
 
             emitStatus({
-              message: `WASM beta · ${queued.frame.width}×${queued.frame.height} · ${displayFps.toFixed(1)} display fps · ${sourceFps.toFixed(1)} source fps · ${rafFps.toFixed(1)} rAF fps · ${decodeFps.toFixed(1)} decode fps · render ${renderMsEma.toFixed(1)}ms · ${droppedFrames} dropped · q${frameQueue.length} · AV ${avDriftMs >= 0 ? "+" : ""}${avDriftMs.toFixed(0)}ms · live HLS · ${this.audio?.status ?? "video only"}`,
+              message: `WASM beta · ${queued.frame.width}×${queued.frame.height} · ${displayFps.toFixed(1)} display fps · ${sourceFps.toFixed(1)} source fps · ${rafFps.toFixed(1)} rAF fps · ${decodeFps.toFixed(1)} decode fps · render ${renderMsEma.toFixed(1)}ms · ${droppedFrames} dropped · q${frameQueue.length} · AV ${avDriftMs >= 0 ? "+" : ""}${avDriftMs.toFixed(0)}ms · init ${initialSyncMs >= 0 ? "+" : ""}${initialSyncMs.toFixed(0)}ms · live HLS · ${this.audio?.status ?? "video only"}`,
               frames: presentedFrames,
               decodedFrames,
               droppedFrames,
@@ -1256,6 +1293,7 @@ export class WasmHlsPlayer {
               frameMs: estimatedFrameMs,
               queueDepth: frameQueue.length,
               avDriftMs,
+              initialSyncMs,
               deliveredSegments,
             });
           }
@@ -1266,7 +1304,7 @@ export class WasmHlsPlayer {
     requestAnimationFrame(present);
 
     emitStatus({
-      message: `WASM beta: decoding H.264 · pure source-cadence rAF queue · ${this.audio?.status ?? "video only"} · ${snapshot.segmentCount}-segment startup buffer${snapshot.seconds ? ` / ~${snapshot.seconds.toFixed(1)}s` : ""}`,
+      message: `WASM beta: decoding H.264 · audio-phased source-cadence rAF queue · ${this.audio?.status ?? "video only"} · ${snapshot.segmentCount}-segment startup buffer${snapshot.seconds ? ` / ~${snapshot.seconds.toFixed(1)}s` : ""}`,
       width: stream.codecpar?.width,
       height: stream.codecpar?.height,
     });
