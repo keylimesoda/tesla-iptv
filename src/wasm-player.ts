@@ -1202,41 +1202,13 @@ export class WasmHlsPlayer {
       if (!this.isPaused && frameQueue.length && cadenceBudgetMs + 0.5 >= estimatedFrameMs) {
         const now = performance.now();
 
-        // Keep cadence independent of audio. Audio only tells us when video has
-        // drifted far enough to justify a discrete drop/hold correction.
-        const headMediaSeconds = frameQueue[0].mediaSeconds;
-        const headAudioTarget = headMediaSeconds !== null
-          ? this.audio?.targetWallMs(headMediaSeconds) ?? null
-          : null;
-
-        let holdForAudio = false;
-        if (headAudioTarget !== null) {
-          avDriftMs = headAudioTarget - now;
-
-          if (avDriftMs < -100 && frameQueue.length > 1) {
-            let stale = 0;
-            while (stale < frameQueue.length - 1) {
-              const mediaSeconds = frameQueue[stale].mediaSeconds;
-              if (mediaSeconds === null) break;
-              const target = this.audio?.targetWallMs(mediaSeconds) ?? null;
-              if (target === null || target >= now - 60) break;
-              stale++;
-            }
-            if (stale > 0) {
-              frameQueue.splice(0, stale);
-              droppedFrames += stale;
-            }
-          } else if (avDriftMs > 100) {
-            // Video is materially ahead of audio: hold a compositor tick rather
-            // than changing the nominal source frame interval.
-            holdForAudio = true;
-            cadenceBudgetMs = Math.min(cadenceBudgetMs, estimatedFrameMs);
-          }
-        }
-
-        if (!holdForAudio && frameQueue.length) {
-          const queued = frameQueue.shift()!;
-          cadenceBudgetMs = Math.max(0, cadenceBudgetMs - estimatedFrameMs);
+        // Do not let the audio clock gate presentation cadence. On the Tesla,
+        // that interaction was catastrophically under-presenting otherwise
+        // healthy 30 fps streams (4–7 fps with 60 Hz rAF and huge decode headroom).
+        // First prove/maintain source-rate video; audio drift is measured below
+        // and can be corrected with a very slow PLL once cadence is solid.
+        const queued = frameQueue.shift()!;
+        cadenceBudgetMs = Math.max(0, cadenceBudgetMs - estimatedFrameMs);
 
           const renderStart = performance.now();
           this.renderer!.render(queued.frame);
@@ -1287,7 +1259,6 @@ export class WasmHlsPlayer {
               deliveredSegments,
             });
           }
-        }
       }
 
       requestAnimationFrame(present);
@@ -1295,7 +1266,7 @@ export class WasmHlsPlayer {
     requestAnimationFrame(present);
 
     emitStatus({
-      message: `WASM beta: decoding H.264 · rAF budget queue · ${this.audio?.status ?? "video only"} · ${snapshot.segmentCount}-segment startup buffer${snapshot.seconds ? ` / ~${snapshot.seconds.toFixed(1)}s` : ""}`,
+      message: `WASM beta: decoding H.264 · pure source-cadence rAF queue · ${this.audio?.status ?? "video only"} · ${snapshot.segmentCount}-segment startup buffer${snapshot.seconds ? ` / ~${snapshot.seconds.toFixed(1)}s` : ""}`,
       width: stream.codecpar?.width,
       height: stream.codecpar?.height,
     });
@@ -1304,10 +1275,10 @@ export class WasmHlsPlayer {
       while (this.isPaused && generation === this.generation) await sleep(50);
       if (generation !== this.generation) break;
 
-      // Keep only a modest decoded cushion. At 1080p a YUV420 frame is ~3 MiB,
-      // so the old ~45-frame queue could retain well over 100 MiB and create
-      // avoidable GC/memory pressure. 12 frames is ~400 ms at 30 fps.
-      while (frameQueue.length >= 12 && generation === this.generation && !this.isPaused) {
+      // Keep a modest decoded cushion. 24 frames is ~800 ms at 30 fps: enough
+      // for bursty HD HLS delivery without returning to the old multi-second
+      // raw-frame backlog.
+      while (frameQueue.length >= 24 && generation === this.generation && !this.isPaused) {
         await sleep(5);
       }
       if (generation !== this.generation) break;
