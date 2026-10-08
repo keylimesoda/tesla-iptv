@@ -1170,6 +1170,7 @@ export class WasmHlsPlayer {
     let syncWaitStartedAt = performance.now();
     let videoStartWallMs: number | null = null;
     let initialSyncMs = 0;
+    let startupSkipped = 0;
 
     type QueuedVideoFrame = {
       frame: any;
@@ -1195,25 +1196,42 @@ export class WasmHlsPlayer {
       lastRafTimestamp = timestamp;
       const now = performance.now();
 
-      // Establish A/V phase exactly once at startup. The previous attempts used
-      // audio as a per-frame gate, which destroyed cadence. Instead, wait until
-      // the audio timeline can tell us when the queue head should appear, hold
-      // video until that instant, then run video at the source cadence forever.
+      // Establish A/V phase exactly once at startup. Crucially, keep demuxing
+      // until the native audio clock actually exists; the old 24-frame queue
+      // backpressure could stop demux before enough AAC had arrived to start
+      // Web Audio, so video timed out and began ~1.5 s before audio.
       if (!this.isPaused && frameQueue.length && syncState === "waiting") {
-        const headMediaSeconds = frameQueue[0].mediaSeconds;
-        const audioTarget = headMediaSeconds !== null
-          ? this.audio?.targetWallMs(headMediaSeconds) ?? null
-          : null;
+        let alignedIndex = -1;
+        let alignedTarget: number | null = null;
 
-        if (audioTarget !== null) {
-          avDriftMs = audioTarget - now;
+        // Once AudioContext has a media-time mapping, discard only pre-roll
+        // video frames whose matching audio time has already passed. Start on
+        // the first frame at/just ahead of the audio playhead.
+        for (let i = 0; i < frameQueue.length; i++) {
+          const mediaSeconds = frameQueue[i].mediaSeconds;
+          if (mediaSeconds === null) continue;
+          const target = this.audio?.targetWallMs(mediaSeconds) ?? null;
+          if (target === null) break;
+
+          alignedIndex = i;
+          alignedTarget = target;
+          if (target >= now + 15) break;
+        }
+
+        if (alignedIndex >= 0 && alignedTarget !== null) {
+          if (alignedIndex > 0) {
+            frameQueue.splice(0, alignedIndex);
+            startupSkipped += alignedIndex;
+          }
+
+          avDriftMs = alignedTarget - now;
           initialSyncMs = avDriftMs;
-          videoStartWallMs = Math.max(now, audioTarget);
+          videoStartWallMs = Math.max(now, alignedTarget);
           syncState = "armed";
           cadenceBudgetMs = 0;
-        } else if (now - syncWaitStartedAt > 1200) {
-          // Never make video fail just because an audio clock cannot be
-          // established. Fall back to immediate source-cadence playback.
+        } else if (now - syncWaitStartedAt > 5000) {
+          // Audio may be unsupported/broken on an otherwise valid video feed.
+          // After a generous pre-roll, keep video usable rather than hanging.
           syncState = "running";
           cadenceBudgetMs = estimatedFrameMs;
         }
@@ -1279,7 +1297,7 @@ export class WasmHlsPlayer {
             const sourceFps = estimatedFrameMs > 0 ? 1000 / estimatedFrameMs : 0;
 
             emitStatus({
-              message: `WASM beta · ${queued.frame.width}×${queued.frame.height} · ${displayFps.toFixed(1)} display fps · ${sourceFps.toFixed(1)} source fps · ${rafFps.toFixed(1)} rAF fps · ${decodeFps.toFixed(1)} decode fps · render ${renderMsEma.toFixed(1)}ms · ${droppedFrames} dropped · q${frameQueue.length} · AV ${avDriftMs >= 0 ? "+" : ""}${avDriftMs.toFixed(0)}ms · init ${initialSyncMs >= 0 ? "+" : ""}${initialSyncMs.toFixed(0)}ms · live HLS · ${this.audio?.status ?? "video only"}`,
+              message: `WASM beta · ${queued.frame.width}×${queued.frame.height} · ${displayFps.toFixed(1)} display fps · ${sourceFps.toFixed(1)} source fps · ${rafFps.toFixed(1)} rAF fps · ${decodeFps.toFixed(1)} decode fps · render ${renderMsEma.toFixed(1)}ms · ${droppedFrames} dropped · q${frameQueue.length} · pre ${startupSkipped} · AV ${avDriftMs >= 0 ? "+" : ""}${avDriftMs.toFixed(0)}ms · init ${initialSyncMs >= 0 ? "+" : ""}${initialSyncMs.toFixed(0)}ms · live HLS · ${this.audio?.status ?? "video only"}`,
               frames: presentedFrames,
               decodedFrames,
               droppedFrames,
@@ -1294,6 +1312,7 @@ export class WasmHlsPlayer {
               queueDepth: frameQueue.length,
               avDriftMs,
               initialSyncMs,
+              startupSkipped,
               deliveredSegments,
             });
           }
@@ -1313,11 +1332,19 @@ export class WasmHlsPlayer {
       while (this.isPaused && generation === this.generation) await sleep(50);
       if (generation !== this.generation) break;
 
-      // Keep a modest decoded cushion. 24 frames is ~800 ms at 30 fps: enough
-      // for bursty HD HLS delivery without returning to the old multi-second
-      // raw-frame backlog.
-      while (frameQueue.length >= 24 && generation === this.generation && !this.isPaused) {
-        await sleep(5);
+      // Keep a modest decoded cushion during normal playback. While waiting for
+      // the native audio clock, NEVER stop demuxing on video queue depth: AAC
+      // may appear later in the interleaved stream. Instead retain only a rolling
+      // 24-frame video window so audio can continue arriving without unbounded
+      // raw-frame memory growth.
+      if (syncState === "waiting" && frameQueue.length > 24) {
+        const trim = frameQueue.length - 24;
+        frameQueue.splice(0, trim);
+        startupSkipped += trim;
+      } else {
+        while (frameQueue.length >= 24 && generation === this.generation && !this.isPaused) {
+          await sleep(5);
+        }
       }
       if (generation !== this.generation) break;
 
